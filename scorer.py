@@ -1,18 +1,14 @@
 """
 ماژول امتیازدهی ارزهای BITFA
-نسخه اولیه - بر اساس داده‌های تاریخی کانال
+نسخه ۰.۱ - اولیه
 """
 
 import requests
 from typing import Dict, Any, Optional
-import time
 
 
 def get_dexscreener_data(token_address: str = None, symbol: str = None) -> Optional[Dict]:
-    """
-    گرفتن داده از DexScreener (رایگان و بدون کلید)
-    اولویت با آدرس کانترکت است.
-    """
+    """گرفتن داده از DexScreener (رایگان و بدون کلید)"""
     try:
         if token_address:
             url = f"https://api.dexscreener.com/latest/dex/tokens/{token_address}"
@@ -21,7 +17,7 @@ def get_dexscreener_data(token_address: str = None, symbol: str = None) -> Optio
         else:
             return None
 
-        resp = requests.get(url, timeout=10)
+        resp = requests.get(url, timeout=12)
         if resp.status_code == 200:
             return resp.json()
         return None
@@ -32,38 +28,61 @@ def get_dexscreener_data(token_address: str = None, symbol: str = None) -> Optio
 
 def calculate_score(data: Dict) -> Dict[str, Any]:
     """
-    محاسبه امتیاز از ۱۰۰ بر اساس فیلترهای تعریف‌شده
-    این نسخه اولیه است و بعداً دقیق‌تر می‌شود.
+    محاسبه امتیاز از ۱۰۰
+    این نسخه خیلی ساده است و فقط اسکلت کار می‌کند.
+    فیلترهای واقعی در نسخه‌های بعدی اضافه می‌شوند.
     """
-    score = 50  # پایه
-    reasons = []
+    score = 40
+    reasons = ["نسخه اولیه - فیلترها هنوز کامل نیست"]
 
-    # TODO: فیلترهای واقعی اینجا پیاده‌سازی می‌شوند
-    # 1. امنیت
-    # 2. لیکوئیدیتی و حجم
-    # 3. مارکت‌کپ
-    # 4. مومنتوم
+    pairs = data.get("pairs") or []
+    if pairs:
+        pair = pairs[0]
+        liquidity = pair.get("liquidity", {}).get("usd", 0) or 0
+        volume_24h = pair.get("volume", {}).get("h24", 0) or 0
+
+        if liquidity > 50000:
+            score += 15
+            reasons.append(f"لیکوئیدیتی مناسب: ${liquidity:,.0f}")
+        elif liquidity > 10000:
+            score += 8
+            reasons.append(f"لیکوئیدیتی متوسط: ${liquidity:,.0f}")
+        else:
+            reasons.append(f"لیکوئیدیتی پایین: ${liquidity:,.0f}")
+
+        if volume_24h > 100000:
+            score += 15
+            reasons.append(f"حجم ۲۴س خوب: ${volume_24h:,.0f}")
+        elif volume_24h > 20000:
+            score += 8
+            reasons.append(f"حجم ۲۴س متوسط: ${volume_24h:,.0f}")
+
+        price_change = pair.get("priceChange", {}).get("h24", 0) or 0
+        if 5 < price_change < 80:
+            score += 10
+            reasons.append(f"تغییر قیمت ۲۴س معقول: {price_change:.1f}%")
+
+    score = max(0, min(100, score))
+
+    recommendation = "صبر کنید تا فیلترها کامل شود"
+    if score >= 70:
+        recommendation = "امتیاز نسبتاً خوب (نسخه اولیه)"
+    elif score >= 50:
+        recommendation = "متوسط"
+    else:
+        recommendation = "ضعیف یا داده ناکافی"
 
     return {
         "score": score,
         "reasons": reasons,
-        "recommendation": "در حال توسعه",
-        "raw_data": data
+        "recommendation": recommendation,
+        "note": "این نسخه آزمایشی است و توصیه مالی نیست"
     }
 
 
 def analyze_token(symbol: str = None, address: str = None) -> Dict[str, Any]:
-    """
-    تابع اصلی تحلیل یک ارز
-    """
     data = get_dexscreener_data(token_address=address, symbol=symbol)
     if not data:
-        return {"error": "داده پیدا نشد", "score": 0}
+        return {"error": "داده از DexScreener پیدا نشد", "score": 0}
 
-    result = calculate_score(data)
-    return result
-
-
-if __name__ == "__main__":
-    # تست ساده
-    print(analyze_token(symbol="BTC"))
+    return calculate_score(data)
