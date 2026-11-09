@@ -6,7 +6,11 @@ import os
 
 from scorer import analyze_token
 
-app = FastAPI(title="BITFA Signal Scorer", version="0.1.0")
+app = FastAPI(
+    title="BITFA Signal Scorer",
+    description="امتیازدهی ارزهای معرفی‌شده در کانال BITFA",
+    version="0.2.0"
+)
 
 class AnalyzeRequest(BaseModel):
     symbol: Optional[str] = None
@@ -16,18 +20,22 @@ class AnalyzeRequest(BaseModel):
 def root():
     return {
         "status": "ok",
+        "version": "0.2.0",
         "message": "BITFA Signal Scorer is running",
-        "usage": "POST /analyze with {\"symbol\": \"TICKER\"} or {\"address\": \"0x...\"}"
+        "usage": "POST /analyze  with JSON body: {\"symbol\": \"TICKER\"} or {\"address\": \"contract\"}"
     }
 
 @app.get("/health")
 def health():
-    return {"status": "healthy"}
+    return {"status": "healthy", "version": "0.2.0"}
 
 @app.post("/analyze")
 def analyze(req: AnalyzeRequest):
     if not req.symbol and not req.address:
-        return {"error": "symbol or address is required", "score": 0}
+        return {
+            "error": "symbol یا address الزامی است",
+            "score": 0
+        }
     
     result = analyze_token(symbol=req.symbol, address=req.address)
     return result
