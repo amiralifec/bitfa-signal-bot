@@ -1,5 +1,6 @@
 """
-BITFA Scorer + Telegram Bot (Webhook mode)
+BITFA Scorer + Telegram Bot (Webhook)
+نسخه ۰.۷ - پشتیبانی از چند تیکر/آدرس در یک پیام
 """
 
 import os
@@ -7,7 +8,7 @@ import re
 import logging
 from fastapi import FastAPI, Request, Response
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 import uvicorn
 import requests as http_requests
 
@@ -19,7 +20,7 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_BASE = os.getenv("RENDER_EXTERNAL_URL") or "https://bitfa-signal-bot.onrender.com"
 
-app = FastAPI(title="BITFA Signal Scorer", version="0.6.2")
+app = FastAPI(title="BITFA Signal Scorer", version="0.7.0")
 
 
 class AnalyzeRequest(BaseModel):
@@ -36,7 +37,49 @@ def is_address(text: str) -> bool:
     return False
 
 
-def format_result(result: dict) -> str:
+def parse_items(text: str) -> List[str]:
+    """استخراج تیکر و آدرس از متن (با فاصله، خط جدید، کاما، #)"""
+    # جدا کردن با فاصله، کاما، خط جدید
+    raw = re.split(r"[,\s\n]+", text.strip())
+    items = []
+    for part in raw:
+        part = part.strip().lstrip("#").strip()
+        if not part:
+            continue
+        # حذف کاراکترهای اضافی رایج
+        part = re.sub(r"[^a-zA-Z0-9]", "", part) if not part.startswith("0x") and not is_address(part) else part
+        if len(part) >= 2:
+            items.append(part)
+    # حذف تکراری با حفظ ترتیب
+    seen = set()
+    unique = []
+    for i in items:
+        key = i.lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(i)
+    return unique[:12]  # حداکثر ۱۲ مورد در هر پیام
+
+
+def format_single(name: str, result: dict) -> str:
+    if result.get("error"):
+        return f"*{name}* → خطا: {result.get('error')}"
+
+    score = result.get("score", 0)
+    category = result.get("category", "-")
+    action = result.get("action", "-")
+    risk = result.get("risk_level", "-")
+    pos = result.get("position_suggestion", "-")
+    cat_emoji = {"HOT": "🔥", "QUALIFIED": "✅", "WATCH": "👀", "SKIP": "❌"}.get(category, "▪️")
+
+    return (
+        f"{cat_emoji} *{name}* | {score}/100 | {category}\n"
+        f"اقدام: {action} | ریسک: {risk}\n"
+        f"حجم پیشنهادی: {pos}"
+    )
+
+
+def format_full(result: dict) -> str:
     if result.get("error"):
         return f"❌ خطا: {result.get('error')}"
 
@@ -68,12 +111,12 @@ def format_result(result: dict) -> str:
 
     if reasons:
         lines.append("\n✅ *نکات:*")
-        for r in reasons[:6]:
+        for r in reasons[:5]:
             lines.append(f"• {r}")
 
     if warnings:
         lines.append("\n⚠️ *هشدارها:*")
-        for w in warnings[:5]:
+        for w in warnings[:4]:
             lines.append(f"• {w}")
 
     if metrics:
@@ -86,10 +129,8 @@ def format_result(result: dict) -> str:
             lines.append(f"• مارکت‌کپ: ${metrics['market_cap']:,.0f}")
         if metrics.get("price_change_24h") is not None:
             lines.append(f"• تغییر ۲۴س: {metrics['price_change_24h']}%")
-        if metrics.get("chain"):
-            lines.append(f"• زنجیره: {metrics['chain']}")
 
-    lines.append("\n_NFA | DYOR | فقط آموزشی_")
+    lines.append("\n_NFA | DYOR_")
     return "\n".join(lines)
 
 
@@ -97,9 +138,12 @@ def send_telegram_message(chat_id: int, text: str):
     if not BOT_TOKEN:
         return
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    # تلگرام محدودیت طول دارد
+    if len(text) > 4000:
+        text = text[:3900] + "\n\n... (خلاصه شده)"
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
     try:
-        http_requests.post(url, json=payload, timeout=10)
+        http_requests.post(url, json=payload, timeout=15)
     except Exception as e:
         logger.error(f"send message failed: {e}")
 
@@ -108,15 +152,15 @@ def send_telegram_message(chat_id: int, text: str):
 def root():
     return {
         "status": "ok",
-        "version": "0.6.2",
-        "message": "BITFA Scorer + Telegram Webhook",
+        "version": "0.7.0",
+        "message": "BITFA Scorer + multi-token Telegram bot",
         "bot": "enabled" if BOT_TOKEN else "disabled"
     }
 
 
 @app.get("/health")
 def health():
-    return {"status": "healthy", "version": "0.6.2"}
+    return {"status": "healthy", "version": "0.7.0"}
 
 
 @app.post("/analyze")
@@ -149,31 +193,76 @@ async def telegram_webhook(request: Request):
     if text.startswith("/start"):
         send_telegram_message(
             chat_id,
-            "سلام 👋\nمن ربات امتیازدهی سبک BITFA هستم.\n\nتیکر یا آدرس قرارداد را بفرست.\nمثال: `PEPE` یا `0x...`"
+            "سلام 👋\nربات امتیازدهی سبک BITFA\n\n"
+            "• یک تیکر یا آدرس بفرست\n"
+            "• یا چند تا را با هم بفرست (با فاصله یا خط جدید)\n\n"
+            "مثال:\n`PEPE BONK WIF`\nیا\n`0x55ad...`"
         )
         return Response(status_code=200)
 
     if text.startswith("/help"):
-        send_telegram_message(chat_id, "فقط تیکر یا آدرس قرارداد را بفرست.")
+        send_telegram_message(
+            chat_id,
+            "تیکر یا آدرس بفرست.\nچند مورد را می‌توانی در یک پیام بفرستی (حداکثر ۱۲ تا)."
+        )
         return Response(status_code=200)
 
     if text.startswith("/"):
         return Response(status_code=200)
 
-    send_telegram_message(chat_id, "در حال تحلیل... ⏳")
+    items = parse_items(text)
+    if not items:
+        send_telegram_message(chat_id, "چیزی برای تحلیل پیدا نشد. تیکر یا آدرس بفرست.")
+        return Response(status_code=200)
 
-    try:
-        if is_address(text):
-            result = analyze_token(address=text)
-        else:
-            symbol = text.replace("#", "").upper()
-            result = analyze_token(symbol=symbol)
-        reply = format_result(result)
+    send_telegram_message(chat_id, f"در حال تحلیل {len(items)} مورد... ⏳")
+
+    results = []
+    summary = {"HOT": [], "QUALIFIED": [], "WATCH": [], "SKIP": []}
+
+    for item in items:
+        try:
+            if is_address(item):
+                result = analyze_token(address=item)
+                name = item[:8] + "..." + item[-4:] if len(item) > 14 else item
+            else:
+                result = analyze_token(symbol=item.upper())
+                name = item.upper()
+
+            results.append((name, result))
+            cat = result.get("category", "SKIP")
+            if cat in summary:
+                summary[cat].append(f"{name} ({result.get('score', 0)})")
+        except Exception as e:
+            results.append((item, {"error": str(e)[:80], "score": 0, "category": "SKIP"}))
+            summary["SKIP"].append(item)
+
+    # اگر فقط یک مورد بود → گزارش کامل
+    if len(results) == 1:
+        name, result = results[0]
+        reply = format_full(result)
         send_telegram_message(chat_id, reply)
-    except Exception as e:
-        logger.exception("analyze error")
-        send_telegram_message(chat_id, f"خطا در تحلیل: {str(e)[:150]}")
+        return Response(status_code=200)
 
+    # چند مورد → خلاصه + جزئیات کوتاه
+    lines = ["📋 *خلاصه نتایج*\n"]
+
+    if summary["HOT"]:
+        lines.append("🔥 *HOT:* " + ", ".join(summary["HOT"]))
+    if summary["QUALIFIED"]:
+        lines.append("✅ *QUALIFIED:* " + ", ".join(summary["QUALIFIED"]))
+    if summary["WATCH"]:
+        lines.append("👀 *WATCH:* " + ", ".join(summary["WATCH"]))
+    if summary["SKIP"]:
+        lines.append("❌ *SKIP:* " + ", ".join(summary["SKIP"]))
+
+    lines.append("\n────────────\n*جزئیات:*\n")
+    for name, result in results:
+        lines.append(format_single(name, result))
+        lines.append("")
+
+    lines.append("_NFA | DYOR_")
+    send_telegram_message(chat_id, "\n".join(lines))
     return Response(status_code=200)
 
 
