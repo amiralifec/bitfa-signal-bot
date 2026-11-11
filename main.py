@@ -1,5 +1,5 @@
 """
-BITFA Scorer + Telegram Bot (Webhook mode - مناسب Render)
+BITFA Scorer + Telegram Bot (Webhook mode)
 """
 
 import os
@@ -9,6 +9,7 @@ from fastapi import FastAPI, Request, Response
 from pydantic import BaseModel
 from typing import Optional
 import uvicorn
+import requests as http_requests
 
 from scorer import analyze_token
 
@@ -16,7 +17,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_BASE = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("WEBHOOK_BASE") or "https://bitfa-signal-bot.onrender.com"
+WEBHOOK_BASE = os.getenv("RENDER_EXTERNAL_URL") or "https://bitfa-signal-bot.onrender.com"
 
 app = FastAPI(title="BITFA Signal Scorer", version="0.6.2")
 
@@ -54,14 +55,14 @@ def format_result(result: dict) -> str:
 
     lines = [
         f"{cat_emoji} *نتیجه تحلیل*",
-        f"",
+        "",
         f"📊 *امتیاز:* {score}/100",
         f"🏷 *دسته:* {category}",
         f"⚡ *اقدام:* {action}",
         f"⚠️ *ریسک:* {risk}",
         f"🎯 *اعتماد:* {conf}%",
         f"💰 *پیشنهاد حجم:* {pos}",
-        f"",
+        "",
         f"📝 *توصیه:*\n{rec}",
     ]
 
@@ -93,17 +94,14 @@ def format_result(result: dict) -> str:
 
 
 def send_telegram_message(chat_id: int, text: str):
-    import requests
+    if not BOT_TOKEN:
+        return
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "Markdown"
-    }
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
     try:
-        requests.post(url, json=payload, timeout=10)
+        http_requests.post(url, json=payload, timeout=10)
     except Exception as e:
-        logger.error(f"Failed to send message: {e}")
+        logger.error(f"send message failed: {e}")
 
 
 @app.get("/")
@@ -151,9 +149,7 @@ async def telegram_webhook(request: Request):
     if text.startswith("/start"):
         send_telegram_message(
             chat_id,
-            "سلام 👋\nمن ربات امتیازدهی سبک BITFA هستم.\n\n"
-            "تیکر یا آدرس قرارداد را بفرست.\n"
-            "مثال: `PEPE` یا `0x...`"
+            "سلام 👋\nمن ربات امتیازدهی سبک BITFA هستم.\n\nتیکر یا آدرس قرارداد را بفرست.\nمثال: `PEPE` یا `0x...`"
         )
         return Response(status_code=200)
 
@@ -164,7 +160,6 @@ async def telegram_webhook(request: Request):
     if text.startswith("/"):
         return Response(status_code=200)
 
-    # در حال تحلیل
     send_telegram_message(chat_id, "در حال تحلیل... ⏳")
 
     try:
@@ -173,7 +168,6 @@ async def telegram_webhook(request: Request):
         else:
             symbol = text.replace("#", "").upper()
             result = analyze_token(symbol=symbol)
-
         reply = format_result(result)
         send_telegram_message(chat_id, reply)
     except Exception as e:
@@ -185,16 +179,14 @@ async def telegram_webhook(request: Request):
 
 @app.on_event("startup")
 def set_webhook():
-    """ست کردن وب‌هوک موقع استارت"""
     if not BOT_TOKEN:
         logger.warning("BOT_TOKEN not set")
         return
-    import requests
     webhook_url = f"{WEBHOOK_BASE.rstrip('/')}/telegram-webhook"
     api = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook"
     try:
-        r = requests.post(api, json={"url": webhook_url}, timeout=10)
-        logger.info(f"Webhook set result: {r.status_code} {r.text[:200]}")
+        r = http_requests.post(api, json={"url": webhook_url}, timeout=10)
+        logger.info(f"Webhook set: {r.status_code} {r.text[:200]}")
     except Exception as e:
         logger.error(f"Failed to set webhook: {e}")
 
