@@ -8,8 +8,8 @@ from scorer import analyze_token
 
 app = FastAPI(
     title="BITFA Signal Scorer",
-    description="امتیازدهی ارزهای معرفی‌شده در کانال BITFA",
-    version="0.2.0"
+    description="امتیازدهی ارزهای BITFA - نسخه ۰.۳",
+    version="0.3.0"
 )
 
 class AnalyzeRequest(BaseModel):
@@ -20,25 +20,21 @@ class AnalyzeRequest(BaseModel):
 def root():
     return {
         "status": "ok",
-        "version": "0.2.0",
+        "version": "0.3.0",
         "message": "BITFA Signal Scorer is running",
-        "usage": "POST /analyze  with JSON body: {\"symbol\": \"TICKER\"} or {\"address\": \"contract\"}"
+        "style": "Based on BITFA patterns: trend break + pullback, support, horizontal breakouts",
+        "usage": "POST /analyze with {\"symbol\": \"TICKER\"} or {\"address\": \"0x...\"}"
     }
 
 @app.get("/health")
 def health():
-    return {"status": "healthy", "version": "0.2.0"}
+    return {"status": "healthy", "version": "0.3.0"}
 
 @app.post("/analyze")
 def analyze(req: AnalyzeRequest):
     if not req.symbol and not req.address:
-        return {
-            "error": "symbol یا address الزامی است",
-            "score": 0
-        }
-    
-    result = analyze_token(symbol=req.symbol, address=req.address)
-    return result
+        return {"error": "symbol یا address الزامی است", "score": 0}
+    return analyze_token(symbol=req.symbol, address=req.address)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
