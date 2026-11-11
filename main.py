@@ -1,6 +1,6 @@
 """
-BITFA Scorer + Telegram Bot (Webhook)
-نسخه ۰.۷ - پشتیبانی از چند تیکر/آدرس در یک پیام
+BITFA Scorer + Telegram Bot
+نسخه ۰.۸ - استخراج خودکار تیکر از متن واچ‌لیست‌مانند کانال BITFA
 """
 
 import os
@@ -20,7 +20,18 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_BASE = os.getenv("RENDER_EXTERNAL_URL") or "https://bitfa-signal-bot.onrender.com"
 
-app = FastAPI(title="BITFA Signal Scorer", version="0.7.0")
+app = FastAPI(title="BITFA Signal Scorer", version="0.8.0")
+
+# کلمات رایج که تیکر نیستند
+STOPWORDS = {
+    "BITFA", "WATCHLIST", "NFA", "DYOR", "USDT", "USD", "BTC", "ETH",
+    "THE", "AND", "FOR", "WITH", "FROM", "THIS", "THAT", "HTTP", "HTTPS",
+    "COM", "WWW", "PDF", "IMG", "PNG", "JPG", "HTML", "NULL", "TRUE", "FALSE",
+    "LONG", "SHORT", "BUY", "SELL", "ENTRY", "EXIT", "STOP", "TARGET",
+    "SUPPORT", "RESISTANCE", "BREAKOUT", "PULLBACK", "WATCH", "LIST",
+    "SIGNAL", "FUTURES", "SPOT", "DEX", "CEX", "SOL", "BSC", "BASE",
+    "ARIA", "UPDATE", "NOTE", "WARNING", "DISCLAIMER"
+}
 
 
 class AnalyzeRequest(BaseModel):
@@ -37,19 +48,43 @@ def is_address(text: str) -> bool:
     return False
 
 
-def parse_items(text: str) -> List[str]:
-    """استخراج تیکر و آدرس از متن (با فاصله، خط جدید، کاما، #)"""
-    # جدا کردن با فاصله، کاما، خط جدید
-    raw = re.split(r"[,\s\n]+", text.strip())
+def extract_tickers_and_addresses(text: str) -> List[str]:
+    """
+    استخراج هوشمند از متن واچ‌لیست:
+    - آدرس‌های قرارداد
+    - هشتگ‌ها (#PEPE)
+    - تیکرهای جدا با فاصله/کاما/خط جدید
+    """
     items = []
-    for part in raw:
-        part = part.strip().lstrip("#").strip()
-        if not part:
-            continue
-        # حذف کاراکترهای اضافی رایج
-        part = re.sub(r"[^a-zA-Z0-9]", "", part) if not part.startswith("0x") and not is_address(part) else part
-        if len(part) >= 2:
-            items.append(part)
+
+    # ۱. آدرس‌های EVM و Solana-like
+    for m in re.finditer(r"0x[a-fA-F0-9]{40}", text):
+        items.append(m.group(0))
+    for m in re.finditer(r"\b[1-9A-HJ-NP-Za-km-z]{32,44}\b", text):
+        cand = m.group(0)
+        if not cand.isdigit() and cand not in items:
+            items.append(cand)
+
+    # ۲. هشتگ‌ها (سبک اصلی کانال BITFA)
+    for m in re.finditer(r"#([A-Za-z][A-Za-z0-9]{1,14})", text):
+        t = m.group(1).upper()
+        if t not in STOPWORDS and t not in [x.upper() for x in items]:
+            items.append(t)
+
+    # ۳. کلمات جدا که شبیه تیکر هستند (اگر هشتگ نبود)
+    # فقط اگر متن کوتاه باشد یا ساختار لیستی داشته باشد
+    if len(items) < 2:
+        parts = re.split(r"[,\s\n/|]+", text)
+        for part in parts:
+            part = part.strip().lstrip("#").strip()
+            if not part:
+                continue
+            # تیکر خالص حروف و عدد
+            if re.match(r"^[A-Za-z][A-Za-z0-9]{1,11}$", part):
+                t = part.upper()
+                if t not in STOPWORDS and t not in [x.upper() for x in items]:
+                    items.append(t)
+
     # حذف تکراری با حفظ ترتیب
     seen = set()
     unique = []
@@ -58,7 +93,8 @@ def parse_items(text: str) -> List[str]:
         if key not in seen:
             seen.add(key)
             unique.append(i)
-    return unique[:12]  # حداکثر ۱۲ مورد در هر پیام
+
+    return unique[:15]  # حداکثر ۱۵ مورد
 
 
 def format_single(name: str, result: dict) -> str:
@@ -138,7 +174,6 @@ def send_telegram_message(chat_id: int, text: str):
     if not BOT_TOKEN:
         return
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    # تلگرام محدودیت طول دارد
     if len(text) > 4000:
         text = text[:3900] + "\n\n... (خلاصه شده)"
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
@@ -152,15 +187,15 @@ def send_telegram_message(chat_id: int, text: str):
 def root():
     return {
         "status": "ok",
-        "version": "0.7.0",
-        "message": "BITFA Scorer + multi-token Telegram bot",
+        "version": "0.8.0",
+        "message": "BITFA Scorer - extract tickers from watchlist text",
         "bot": "enabled" if BOT_TOKEN else "disabled"
     }
 
 
 @app.get("/health")
 def health():
-    return {"status": "healthy", "version": "0.7.0"}
+    return {"status": "healthy", "version": "0.8.0"}
 
 
 @app.post("/analyze")
@@ -194,28 +229,35 @@ async def telegram_webhook(request: Request):
         send_telegram_message(
             chat_id,
             "سلام 👋\nربات امتیازدهی سبک BITFA\n\n"
-            "• یک تیکر یا آدرس بفرست\n"
-            "• یا چند تا را با هم بفرست (با فاصله یا خط جدید)\n\n"
-            "مثال:\n`PEPE BONK WIF`\nیا\n`0x55ad...`"
+            "می‌توانی بفرستی:\n"
+            "• یک تیکر یا آدرس\n"
+            "• چند تیکر با فاصله\n"
+            "• کل متن واچ‌لیست کانال (با #TICKER)\n\n"
+            "ربات خودش تیکرها را استخراج می‌کند."
         )
         return Response(status_code=200)
 
     if text.startswith("/help"):
         send_telegram_message(
             chat_id,
-            "تیکر یا آدرس بفرست.\nچند مورد را می‌توانی در یک پیام بفرستی (حداکثر ۱۲ تا)."
+            "متن واچ‌لیست یا لیست تیکر را بفرست.\n"
+            "هشتگ‌ها (#PEPE) و آدرس‌ها به صورت خودکار پیدا می‌شوند."
         )
         return Response(status_code=200)
 
     if text.startswith("/"):
         return Response(status_code=200)
 
-    items = parse_items(text)
+    items = extract_tickers_and_addresses(text)
     if not items:
-        send_telegram_message(chat_id, "چیزی برای تحلیل پیدا نشد. تیکر یا آدرس بفرست.")
+        send_telegram_message(
+            chat_id,
+            "تیکر یا آدرسی پیدا نشد.\n"
+            "متن واچ‌لیست را با هشتگ بفرست یا تیکرها را جدا بنویس."
+        )
         return Response(status_code=200)
 
-    send_telegram_message(chat_id, f"در حال تحلیل {len(items)} مورد... ⏳")
+    send_telegram_message(chat_id, f"{len(items)} مورد پیدا شد. در حال تحلیل... ⏳")
 
     results = []
     summary = {"HOT": [], "QUALIFIED": [], "WATCH": [], "SKIP": []}
@@ -224,7 +266,7 @@ async def telegram_webhook(request: Request):
         try:
             if is_address(item):
                 result = analyze_token(address=item)
-                name = item[:8] + "..." + item[-4:] if len(item) > 14 else item
+                name = item[:6] + "..." + item[-4:] if len(item) > 12 else item
             else:
                 result = analyze_token(symbol=item.upper())
                 name = item.upper()
@@ -235,16 +277,13 @@ async def telegram_webhook(request: Request):
                 summary[cat].append(f"{name} ({result.get('score', 0)})")
         except Exception as e:
             results.append((item, {"error": str(e)[:80], "score": 0, "category": "SKIP"}))
-            summary["SKIP"].append(item)
+            summary["SKIP"].append(str(item))
 
-    # اگر فقط یک مورد بود → گزارش کامل
     if len(results) == 1:
-        name, result = results[0]
-        reply = format_full(result)
-        send_telegram_message(chat_id, reply)
+        _, result = results[0]
+        send_telegram_message(chat_id, format_full(result))
         return Response(status_code=200)
 
-    # چند مورد → خلاصه + جزئیات کوتاه
     lines = ["📋 *خلاصه نتایج*\n"]
 
     if summary["HOT"]:
