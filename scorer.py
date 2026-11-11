@@ -1,6 +1,6 @@
 """
-BITFA Signal Scorer - Version 0.5
-قوی‌تر شده: انتخاب هوشمند جفت + جریمه حجم ضعیف + امتیاز اعتماد
+BITFA Signal Scorer - Version 0.6
+خروجی مرتب‌تر + پیشنهاد تقریبی اندازه پوزیشن بر اساس سطح ریسک
 """
 
 import requests
@@ -47,23 +47,16 @@ def pair_age_hours(pair: Dict) -> Optional[float]:
 
 
 def select_best_pair(pairs: List[Dict]) -> Optional[Dict]:
-    """
-    انتخاب هوشمند جفت:
-    اولویت با جفت‌هایی که هم لیکوئیدیتی قابل قبول دارند و هم حجم معنادار.
-    """
     if not pairs:
         return None
-
     scored = []
     for p in pairs:
         liq = safe_float(p.get("liquidity", {}).get("usd", 0))
         vol = safe_float(p.get("volume", {}).get("h24", 0))
-        # امتیاز ساده برای انتخاب جفت
-        pair_score = liq * 0.6 + vol * 0.4
+        pair_score = liq * 0.55 + vol * 0.45
         if liq < 3000 and vol < 2000:
-            pair_score *= 0.3  # جفت‌های مرده را تنزل بده
+            pair_score *= 0.25
         scored.append((pair_score, p))
-
     scored.sort(key=lambda x: x[0], reverse=True)
     return scored[0][1]
 
@@ -72,7 +65,7 @@ def calculate_score(data: Dict, symbol: str = None) -> Dict[str, Any]:
     score = 0
     reasons: List[str] = []
     warnings: List[str] = []
-    confidence = 50  # پایه
+    confidence = 45
 
     pairs = data.get("pairs") or []
     if not pairs:
@@ -80,8 +73,10 @@ def calculate_score(data: Dict, symbol: str = None) -> Dict[str, Any]:
             "score": 0,
             "category": "SKIP",
             "recommendation": "رد - داده کافی نیست",
+            "action": "رد",
             "risk_level": "نامشخص",
             "confidence": 0,
+            "position_suggestion": "هیچ",
             "reasons": ["هیچ جفت معاملاتی پیدا نشد"],
             "warnings": [],
             "metrics": {}
@@ -93,8 +88,10 @@ def calculate_score(data: Dict, symbol: str = None) -> Dict[str, Any]:
             "score": 0,
             "category": "SKIP",
             "recommendation": "رد",
+            "action": "رد",
             "risk_level": "نامشخص",
             "confidence": 0,
+            "position_suggestion": "هیچ",
             "reasons": ["جفت مناسب پیدا نشد"],
             "warnings": [],
             "metrics": {}
@@ -113,20 +110,14 @@ def calculate_score(data: Dict, symbol: str = None) -> Dict[str, Any]:
     dex = pair.get("dexId", "unknown")
     age_h = pair_age_hours(pair)
 
-    # افزایش اعتماد اگر داده کامل باشد
-    if liquidity > 0:
-        confidence += 15
-    if volume_24h > 0:
-        confidence += 10
-    if market_cap > 0:
-        confidence += 10
-    if age_h is not None:
-        confidence += 10
-    if buys + sells > 5:
-        confidence += 5
+    if liquidity > 0: confidence += 15
+    if volume_24h > 0: confidence += 12
+    if market_cap > 0: confidence += 10
+    if age_h is not None: confidence += 10
+    if buys + sells > 8: confidence += 8
     confidence = min(100, confidence)
 
-    # ========== ۱. لیکوئیدیتی (۲۴ امتیاز) ==========
+    # Liquidity (24)
     if liquidity >= 400000:
         score += 24
         reasons.append(f"لیکوئیدیتی عالی: ${liquidity:,.0f}")
@@ -147,9 +138,9 @@ def calculate_score(data: Dict, symbol: str = None) -> Dict[str, Any]:
     else:
         reasons.append(f"لیکوئیدیتی خیلی کم: ${liquidity:,.0f}")
         warnings.append("ریسک نقدشوندگی خطرناک")
-        score -= 5
+        score -= 6
 
-    # ========== ۲. حجم + نسبت به لیکوئیدیتی (۲۲ امتیاز) ==========
+    # Volume (22)
     if volume_24h >= 800000:
         score += 18
         reasons.append(f"حجم بسیار بالا: ${volume_24h:,.0f}")
@@ -167,7 +158,7 @@ def calculate_score(data: Dict, symbol: str = None) -> Dict[str, Any]:
         reasons.append(f"حجم کم: ${volume_24h:,.0f}")
     else:
         reasons.append(f"حجم خیلی کم: ${volume_24h:,.0f}")
-        score -= 4
+        score -= 5
 
     if liquidity > 0:
         vol_liq = volume_24h / liquidity
@@ -177,14 +168,14 @@ def calculate_score(data: Dict, symbol: str = None) -> Dict[str, Any]:
         elif vol_liq >= 0.8:
             score += 3
             reasons.append("نسبت حجم/لیکوئیدیتی قابل قبول")
-        elif vol_liq < 0.15:
-            score -= 8
-            warnings.append("حجم نسبت به لیکوئیدیتی بسیار ضعیف است (جفت کم‌فعال)")
-        elif vol_liq < 0.35:
-            score -= 4
+        elif vol_liq < 0.12:
+            score -= 10
+            warnings.append("حجم نسبت به لیکوئیدیتی بسیار ضعیف (جفت کم‌فعال)")
+        elif vol_liq < 0.30:
+            score -= 5
             warnings.append("حجم نسبت به لیکوئیدیتی ضعیف است")
 
-    # ========== ۳. مارکت‌کپ (۱۸ امتیاز) ==========
+    # Market Cap (18)
     if 0 < market_cap < 2_500_000:
         score += 11
         reasons.append(f"مارکت‌کپ خیلی کم: ${market_cap:,.0f}")
@@ -207,12 +198,11 @@ def calculate_score(data: Dict, symbol: str = None) -> Dict[str, Any]:
         risk_base = "کم"
         warnings.append("پتانسیل رشد انفجاری محدود")
 
-    if market_cap > 0 and liquidity > 0:
-        if liquidity / market_cap < 0.025 and market_cap > 8_000_000:
-            score -= 5
-            warnings.append("لیکوئیدیتی نسبت به مارکت‌کپ پایین است")
+    if market_cap > 0 and liquidity > 0 and liquidity / market_cap < 0.025 and market_cap > 8_000_000:
+        score -= 5
+        warnings.append("لیکوئیدیتی نسبت به مارکت‌کپ پایین است")
 
-    # ========== ۴. مومنتوم (۲۰ امتیاز) ==========
+    # Momentum (20)
     if 8 <= price_change_24h <= 50:
         score += 15
         reasons.append(f"رشد ۲۴س معقول: {price_change_24h:.1f}%")
@@ -231,7 +221,6 @@ def calculate_score(data: Dict, symbol: str = None) -> Dict[str, Any]:
         score += 5
         reasons.append(f"اصلاح خفیف (ممکن است پولبک): {price_change_24h:.1f}%")
     else:
-        score += 0
         reasons.append(f"ریزش: {price_change_24h:.1f}%")
         warnings.append("فشار فروش")
 
@@ -242,7 +231,7 @@ def calculate_score(data: Dict, symbol: str = None) -> Dict[str, Any]:
         score -= 5
         warnings.append(f"فشار فروش ۱ ساعته: {price_change_1h:.1f}%")
 
-    # ========== ۵. خرید/فروش + سن (۱۶ امتیاز) ==========
+    # Buy pressure + age (16)
     total_tx = buys + sells
     if total_tx > 20:
         buy_ratio = buys / total_tx
@@ -271,7 +260,7 @@ def calculate_score(data: Dict, symbol: str = None) -> Dict[str, Any]:
 
     score = max(0, min(100, int(score)))
 
-    # دسته‌بندی
+    # Category
     if score >= 80 and confidence >= 70:
         category = "HOT"
         recommendation = "امتیاز عالی - قابل بررسی جدی برای ورود محدود"
@@ -296,6 +285,16 @@ def calculate_score(data: Dict, symbol: str = None) -> Dict[str, Any]:
     else:
         risk_level = "کم تا متوسط"
 
+    # Simple position size suggestion (educational only)
+    if category == "SKIP" or score < 45:
+        position_suggestion = "۰٪ از سرمایه (ورود نکن)"
+    elif risk_level == "بالا":
+        position_suggestion = "حداکثر ۱٪ تا ۱.۵٪ از کل سرمایه"
+    elif risk_level == "متوسط":
+        position_suggestion = "حداکثر ۲٪ تا ۳٪ از کل سرمایه"
+    else:
+        position_suggestion = "حداکثر ۳٪ تا ۴٪ از کل سرمایه"
+
     return {
         "score": score,
         "category": category,
@@ -303,6 +302,7 @@ def calculate_score(data: Dict, symbol: str = None) -> Dict[str, Any]:
         "action": action,
         "risk_level": risk_level,
         "confidence": confidence,
+        "position_suggestion": position_suggestion,
         "reasons": reasons,
         "warnings": warnings,
         "metrics": {
@@ -316,12 +316,19 @@ def calculate_score(data: Dict, symbol: str = None) -> Dict[str, Any]:
             "chain": chain,
             "dex": dex
         },
-        "note": "نسخه ۰.۵ | فیلترهای قوی‌تر + انتخاب هوشمند جفت + امتیاز اعتماد | NFA | DYOR"
+        "note": "نسخه ۰.۶ | پیشنهاد اندازه پوزیشن فقط آموزشی است | NFA | DYOR"
     }
 
 
 def analyze_token(symbol: str = None, address: str = None) -> Dict[str, Any]:
     data = get_dexscreener_data(token_address=address, symbol=symbol)
     if not data:
-        return {"error": "داده پیدا نشد", "score": 0, "category": "SKIP", "recommendation": "رد", "confidence": 0}
+        return {
+            "error": "داده پیدا نشد",
+            "score": 0,
+            "category": "SKIP",
+            "recommendation": "رد",
+            "confidence": 0,
+            "position_suggestion": "هیچ"
+        }
     return calculate_score(data, symbol=symbol)
