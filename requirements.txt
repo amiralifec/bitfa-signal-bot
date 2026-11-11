@@ -3,3 +3,4 @@ uvicorn
 requests
 python-dotenv
 pydantic
+python-telegram-bot==20.7
