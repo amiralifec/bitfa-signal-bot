@@ -1,6 +1,6 @@
 """
-BITFA Signal Scorer - Version 0.6
-خروجی مرتب‌تر + پیشنهاد تقریبی اندازه پوزیشن بر اساس سطح ریسک
+BITFA Signal Scorer - Version 0.8.1
+رفع انتخاب جفت اشتباه + اولویت جفت فعال با تغییر قیمت واقعی
 """
 
 import requests
@@ -10,7 +10,9 @@ from datetime import datetime, timezone
 
 def safe_float(value, default=0.0):
     try:
-        return float(value) if value is not None else default
+        if value is None:
+            return default
+        return float(value)
     except:
         return default
 
@@ -46,17 +48,57 @@ def pair_age_hours(pair: Dict) -> Optional[float]:
         return None
 
 
-def select_best_pair(pairs: List[Dict]) -> Optional[Dict]:
+def select_best_pair(pairs: List[Dict], query_symbol: str = None) -> Optional[Dict]:
+    """
+    انتخاب هوشمند:
+    1. اگر تیکر داده شده، فقط جفت‌هایی که baseToken.symbol دقیقاً مطابقت دارد
+    2. اولویت با جفت دارای حجم واقعی + لیکوئیدیتی
+    3. جفت‌های مرده را حذف کن
+    """
     if not pairs:
         return None
+
+    candidates = pairs
+
+    # فیلتر نماد دقیق
+    if query_symbol:
+        q = query_symbol.strip().upper()
+        exact = []
+        for p in pairs:
+            base = p.get("baseToken") or {}
+            sym = (base.get("symbol") or "").upper()
+            if sym == q:
+                exact.append(p)
+        if exact:
+            candidates = exact
+
     scored = []
-    for p in pairs:
-        liq = safe_float(p.get("liquidity", {}).get("usd", 0))
-        vol = safe_float(p.get("volume", {}).get("h24", 0))
-        pair_score = liq * 0.55 + vol * 0.45
-        if liq < 3000 and vol < 2000:
-            pair_score *= 0.25
+    for p in candidates:
+        liq = safe_float((p.get("liquidity") or {}).get("usd", 0))
+        vol = safe_float((p.get("volume") or {}).get("h24", 0))
+        chg = (p.get("priceChange") or {}).get("h24")
+
+        # جفت تقریباً مرده
+        if liq < 2000 and vol < 500:
+            continue
+
+        # امتیاز ترکیبی
+        pair_score = liq * 0.4 + vol * 0.6
+
+        # اگر تغییر قیمت معتبر دارد کمی پاداش بده
+        if chg is not None:
+            pair_score *= 1.15
+
+        # جفت با حجم خیلی کم نسبت به لیکوئیدیتی تنزل
+        if liq > 0 and vol / liq < 0.05 and vol < 20000:
+            pair_score *= 0.5
+
         scored.append((pair_score, p))
+
+    if not scored:
+        # اگر همه فیلتر شدند، از بین همان candidates بالاترین لیکوئیدیتی
+        return max(candidates, key=lambda p: safe_float((p.get("liquidity") or {}).get("usd", 0)))
+
     scored.sort(key=lambda x: x[0], reverse=True)
     return scored[0][1]
 
@@ -66,6 +108,7 @@ def calculate_score(data: Dict, symbol: str = None) -> Dict[str, Any]:
     reasons: List[str] = []
     warnings: List[str] = []
     confidence = 45
+    risk_base = "متوسط"
 
     pairs = data.get("pairs") or []
     if not pairs:
@@ -82,7 +125,7 @@ def calculate_score(data: Dict, symbol: str = None) -> Dict[str, Any]:
             "metrics": {}
         }
 
-    pair = select_best_pair(pairs)
+    pair = select_best_pair(pairs, query_symbol=symbol)
     if not pair:
         return {
             "score": 0,
@@ -97,17 +140,23 @@ def calculate_score(data: Dict, symbol: str = None) -> Dict[str, Any]:
             "metrics": {}
         }
 
-    liquidity = safe_float(pair.get("liquidity", {}).get("usd", 0))
-    volume_24h = safe_float(pair.get("volume", {}).get("h24", 0))
-    price_change_24h = safe_float(pair.get("priceChange", {}).get("h24", 0))
-    price_change_1h = safe_float(pair.get("priceChange", {}).get("h1", 0))
+    liquidity = safe_float((pair.get("liquidity") or {}).get("usd", 0))
+    volume_24h = safe_float((pair.get("volume") or {}).get("h24", 0))
+
+    # تغییر قیمت: اگر None بود، ننویس 0 گمراه‌کننده
+    raw_chg_24h = (pair.get("priceChange") or {}).get("h24")
+    raw_chg_1h = (pair.get("priceChange") or {}).get("h1")
+    price_change_24h = safe_float(raw_chg_24h, default=None) if raw_chg_24h is not None else None
+    price_change_1h = safe_float(raw_chg_1h, default=None) if raw_chg_1h is not None else None
+
     fdv = safe_float(pair.get("fdv", 0))
     market_cap = safe_float(pair.get("marketCap", 0)) or fdv
-    txns = pair.get("txns", {}).get("h24", {})
+    txns = (pair.get("txns") or {}).get("h24", {}) or {}
     buys = safe_float(txns.get("buys", 0))
     sells = safe_float(txns.get("sells", 0))
     chain = pair.get("chainId", "unknown")
     dex = pair.get("dexId", "unknown")
+    base_sym = ((pair.get("baseToken") or {}).get("symbol") or symbol or "?").upper()
     age_h = pair_age_hours(pair)
 
     if liquidity > 0: confidence += 15
@@ -115,6 +164,7 @@ def calculate_score(data: Dict, symbol: str = None) -> Dict[str, Any]:
     if market_cap > 0: confidence += 10
     if age_h is not None: confidence += 10
     if buys + sells > 8: confidence += 8
+    if price_change_24h is not None: confidence += 5
     confidence = min(100, confidence)
 
     # Liquidity (24)
@@ -203,7 +253,10 @@ def calculate_score(data: Dict, symbol: str = None) -> Dict[str, Any]:
         warnings.append("لیکوئیدیتی نسبت به مارکت‌کپ پایین است")
 
     # Momentum (20)
-    if 8 <= price_change_24h <= 50:
+    if price_change_24h is None:
+        reasons.append("داده تغییر ۲۴ ساعته نامشخص")
+        score += 4
+    elif 8 <= price_change_24h <= 50:
         score += 15
         reasons.append(f"رشد ۲۴س معقول: {price_change_24h:.1f}%")
     elif 50 < price_change_24h <= 110:
@@ -224,12 +277,13 @@ def calculate_score(data: Dict, symbol: str = None) -> Dict[str, Any]:
         reasons.append(f"ریزش: {price_change_24h:.1f}%")
         warnings.append("فشار فروش")
 
-    if price_change_1h > 3:
-        score += 4
-        reasons.append(f"مومنتوم ۱س مثبت: {price_change_1h:.1f}%")
-    elif price_change_1h < -6:
-        score -= 5
-        warnings.append(f"فشار فروش ۱ ساعته: {price_change_1h:.1f}%")
+    if price_change_1h is not None:
+        if price_change_1h > 3:
+            score += 4
+            reasons.append(f"مومنتوم ۱س مثبت: {price_change_1h:.1f}%")
+        elif price_change_1h < -6:
+            score -= 5
+            warnings.append(f"فشار فروش ۱ ساعته: {price_change_1h:.1f}%")
 
     # Buy pressure + age (16)
     total_tx = buys + sells
@@ -260,7 +314,6 @@ def calculate_score(data: Dict, symbol: str = None) -> Dict[str, Any]:
 
     score = max(0, min(100, int(score)))
 
-    # Category
     if score >= 80 and confidence >= 70:
         category = "HOT"
         recommendation = "امتیاز عالی - قابل بررسی جدی برای ورود محدود"
@@ -285,7 +338,6 @@ def calculate_score(data: Dict, symbol: str = None) -> Dict[str, Any]:
     else:
         risk_level = "کم تا متوسط"
 
-    # Simple position size suggestion (educational only)
     if category == "SKIP" or score < 45:
         position_suggestion = "۰٪ از سرمایه (ورود نکن)"
     elif risk_level == "بالا":
@@ -303,20 +355,21 @@ def calculate_score(data: Dict, symbol: str = None) -> Dict[str, Any]:
         "risk_level": risk_level,
         "confidence": confidence,
         "position_suggestion": position_suggestion,
+        "token": base_sym,
         "reasons": reasons,
         "warnings": warnings,
         "metrics": {
             "liquidity_usd": round(liquidity),
             "volume_24h": round(volume_24h),
             "market_cap": round(market_cap),
-            "price_change_24h": round(price_change_24h, 2),
-            "price_change_1h": round(price_change_1h, 2),
+            "price_change_24h": round(price_change_24h, 2) if price_change_24h is not None else None,
+            "price_change_1h": round(price_change_1h, 2) if price_change_1h is not None else None,
             "buy_ratio": round(buys / total_tx, 2) if total_tx > 0 else None,
             "pair_age_hours": round(age_h, 1) if age_h is not None else None,
             "chain": chain,
             "dex": dex
         },
-        "note": "نسخه ۰.۶ | پیشنهاد اندازه پوزیشن فقط آموزشی است | NFA | DYOR"
+        "note": "نسخه ۰.۸.۱ | انتخاب جفت اصلاح‌شده | NFA | DYOR"
     }
 
 
