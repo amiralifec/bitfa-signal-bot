@@ -1,12 +1,11 @@
 """
 BITFA Scorer + Telegram Bot
-نسخه ۱.۰ - دستور /scan برای خواندن کانال @bitfa
+نسخه ۱.۱ - پشتیبانی از PDF واچ‌لیست در /scan و آپلود مستقیم
 """
 
 import os
 import re
 import logging
-import asyncio
 from fastapi import FastAPI, Request, Response
 from pydantic import BaseModel
 from typing import Optional, List
@@ -14,6 +13,7 @@ import uvicorn
 import requests as http_requests
 
 from scorer import analyze_token
+from pdf_parser import parse_watchlist_pdf, extract_tickers_from_text
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_BASE = os.getenv("RENDER_EXTERNAL_URL") or "https://bitfa-signal-bot.onrender.com"
 
-app = FastAPI(title="BITFA Signal Scorer", version="1.0.0")
+app = FastAPI(title="BITFA Signal Scorer", version="1.1.0")
 
 STOPWORDS = {
     "BITFA", "WATCHLIST", "NFA", "DYOR", "USDT", "USD", "BTC", "ETH",
@@ -185,6 +185,7 @@ def format_scan(data: dict) -> str:
     lines = [
         "📡 *اسکن کانال BITFA*",
         f"پیام‌های بررسی‌شده: {data.get('messages_checked', 0)}",
+        f"PDFهای خوانده‌شده: {data.get('pdfs_parsed', 0)}",
         f"تیکرهای پیدا شده: {len(data.get('tickers_found') or [])}",
         "",
     ]
@@ -209,6 +210,28 @@ def format_scan(data: dict) -> str:
     return "\n".join(lines)
 
 
+def score_ticker_list(tickers: List[str]) -> dict:
+    results = []
+    summary = {"HOT": [], "QUALIFIED": [], "WATCH": [], "SKIP": []}
+    for t in tickers[:12]:
+        try:
+            r = analyze_token(symbol=t)
+            results.append({"ticker": t, "result": r})
+            cat = r.get("category", "SKIP")
+            if cat in summary:
+                summary[cat].append(f"#{t} ({r.get('score', 0)})")
+        except Exception as e:
+            results.append({"ticker": t, "result": {"error": str(e)[:100], "score": 0, "category": "SKIP"}})
+            summary["SKIP"].append(f"#{t}")
+    return {
+        "messages_checked": 0,
+        "pdfs_parsed": 1,
+        "tickers_found": tickers,
+        "summary": summary,
+        "results": results,
+    }
+
+
 def send_telegram_message(chat_id: int, text: str):
     if not BOT_TOKEN:
         return
@@ -222,19 +245,35 @@ def send_telegram_message(chat_id: int, text: str):
         logger.error(f"send message failed: {e}")
 
 
+def download_telegram_file(file_id: str) -> bytes:
+    # getFile
+    r = http_requests.get(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/getFile",
+        params={"file_id": file_id},
+        timeout=20,
+    )
+    r.raise_for_status()
+    path = (r.json().get("result") or {}).get("file_path")
+    if not path:
+        raise RuntimeError("file_path خالی است")
+    fr = http_requests.get(f"https://api.telegram.org/file/bot{BOT_TOKEN}/{path}", timeout=60)
+    fr.raise_for_status()
+    return fr.content
+
+
 @app.get("/")
 def root():
     return {
         "status": "ok",
-        "version": "1.0.0",
-        "message": "BITFA Scorer + /scan channel",
+        "version": "1.1.0",
+        "message": "BITFA Scorer + /scan + PDF",
         "bot": "enabled" if BOT_TOKEN else "disabled"
     }
 
 
 @app.get("/health")
 def health():
-    return {"status": "healthy", "version": "1.0.0"}
+    return {"status": "healthy", "version": "1.1.0"}
 
 
 @app.post("/analyze")
@@ -258,7 +297,29 @@ async def telegram_webhook(request: Request):
         return Response(status_code=200)
 
     chat_id = message["chat"]["id"]
-    text = (message.get("text") or "").strip()
+    text = (message.get("text") or message.get("caption") or "").strip()
+
+    # آپلود مستقیم PDF به ربات
+    doc = message.get("document")
+    if doc:
+        file_name = (doc.get("file_name") or "").lower()
+        mime = (doc.get("mime_type") or "").lower()
+        if file_name.endswith(".pdf") or "pdf" in mime:
+            send_telegram_message(chat_id, "PDF دریافت شد. در حال استخراج تیکر... ⏳")
+            try:
+                content = download_telegram_file(doc["file_id"])
+                parsed = parse_watchlist_pdf(content)
+                tickers = parsed.get("tickers") or []
+                if not tickers:
+                    send_telegram_message(chat_id, "در این PDF تیکری پیدا نشد.")
+                    return Response(status_code=200)
+                scored = score_ticker_list(tickers)
+                send_telegram_message(chat_id, format_scan(scored))
+            except Exception as e:
+                logger.exception("pdf upload failed")
+                send_telegram_message(chat_id, f"خطا در خواندن PDF:\n{str(e)[:250]}")
+            return Response(status_code=200)
+
     if not text:
         return Response(status_code=200)
 
@@ -267,7 +328,8 @@ async def telegram_webhook(request: Request):
             chat_id,
             "سلام 👋\nربات امتیازدهی سبک BITFA\n\n"
             "• تیکر / آدرس / متن واچ‌لیست بفرست\n"
-            "• یا /scan برای اسکن آخرین پیام‌های کانال @bitfa"
+            "• PDF واچ‌لیست را مستقیم بفرست\n"
+            "• /scan برای اسکن کانال @bitfa (متن + PDF)"
         )
         return Response(status_code=200)
 
@@ -275,16 +337,16 @@ async def telegram_webhook(request: Request):
         send_telegram_message(
             chat_id,
             "دستورات:\n"
-            "/scan — خواندن تیکرهای اخیر کانال BITFA و امتیازدهی\n"
-            "یا مستقیم تیکر/آدرس/متن واچ‌لیست بفرست."
+            "/scan — خواندن پیام و PDFهای اخیر کانال BITFA\n"
+            "یا تیکر/آدرس/متن/فایل PDF بفرست."
         )
         return Response(status_code=200)
 
     if text.startswith("/scan"):
-        send_telegram_message(chat_id, "در حال اسکن کانال @bitfa ... ⏳\nممکن است ۳۰–۹۰ ثانیه طول بکشد.")
+        send_telegram_message(chat_id, "در حال اسکن کانال @bitfa (متن + PDF)... ⏳\nممکن است تا ۲ دقیقه طول بکشد.")
         try:
             from channel_scanner import scan_and_score
-            result = await scan_and_score(limit_messages=40)
+            result = await scan_and_score(limit_messages=50)
             send_telegram_message(chat_id, format_scan(result))
         except Exception as e:
             logger.exception("scan failed")
