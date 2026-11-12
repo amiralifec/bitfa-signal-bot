@@ -1,11 +1,12 @@
 """
 BITFA Scorer + Telegram Bot
-نسخه ۰.۹ - خروجی ترکیبی Dex + CoinGecko با رتبه و لینک
+نسخه ۱.۰ - دستور /scan برای خواندن کانال @bitfa
 """
 
 import os
 import re
 import logging
+import asyncio
 from fastapi import FastAPI, Request, Response
 from pydantic import BaseModel
 from typing import Optional, List
@@ -20,7 +21,7 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_BASE = os.getenv("RENDER_EXTERNAL_URL") or "https://bitfa-signal-bot.onrender.com"
 
-app = FastAPI(title="BITFA Signal Scorer", version="0.9.0")
+app = FastAPI(title="BITFA Signal Scorer", version="1.0.0")
 
 STOPWORDS = {
     "BITFA", "WATCHLIST", "NFA", "DYOR", "USDT", "USD", "BTC", "ETH",
@@ -177,6 +178,37 @@ def format_full(result: dict) -> str:
     return "\n".join(lines)
 
 
+def format_scan(data: dict) -> str:
+    if data.get("error"):
+        return f"❌ خطا در اسکن کانال:\n{data.get('error')}"
+
+    lines = [
+        "📡 *اسکن کانال BITFA*",
+        f"پیام‌های بررسی‌شده: {data.get('messages_checked', 0)}",
+        f"تیکرهای پیدا شده: {len(data.get('tickers_found') or [])}",
+        "",
+    ]
+    summary = data.get("summary") or {}
+    if summary.get("HOT"):
+        lines.append("🔥 *HOT:* " + ", ".join(summary["HOT"]))
+    if summary.get("QUALIFIED"):
+        lines.append("✅ *QUALIFIED:* " + ", ".join(summary["QUALIFIED"]))
+    if summary.get("WATCH"):
+        lines.append("👀 *WATCH:* " + ", ".join(summary["WATCH"]))
+    if summary.get("SKIP"):
+        lines.append("❌ *SKIP:* " + ", ".join(summary["SKIP"]))
+
+    lines.append("\n────────────\n*جزئیات (حداکثر ۱۲ تا):*\n")
+    for item in (data.get("results") or []):
+        t = item.get("ticker")
+        r = item.get("result") or {}
+        lines.append(format_single(t, r))
+        lines.append("")
+
+    lines.append("_دستور: /scan_\n_NFA | DYOR_")
+    return "\n".join(lines)
+
+
 def send_telegram_message(chat_id: int, text: str):
     if not BOT_TOKEN:
         return
@@ -185,7 +217,7 @@ def send_telegram_message(chat_id: int, text: str):
         text = text[:3900] + "\n\n... (خلاصه شده)"
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown", "disable_web_page_preview": True}
     try:
-        http_requests.post(url, json=payload, timeout=15)
+        http_requests.post(url, json=payload, timeout=20)
     except Exception as e:
         logger.error(f"send message failed: {e}")
 
@@ -194,15 +226,15 @@ def send_telegram_message(chat_id: int, text: str):
 def root():
     return {
         "status": "ok",
-        "version": "0.9.0",
-        "message": "BITFA Scorer hybrid Dex + CoinGecko",
+        "version": "1.0.0",
+        "message": "BITFA Scorer + /scan channel",
         "bot": "enabled" if BOT_TOKEN else "disabled"
     }
 
 
 @app.get("/health")
 def health():
-    return {"status": "healthy", "version": "0.9.0"}
+    return {"status": "healthy", "version": "1.0.0"}
 
 
 @app.post("/analyze")
@@ -234,13 +266,29 @@ async def telegram_webhook(request: Request):
         send_telegram_message(
             chat_id,
             "سلام 👋\nربات امتیازدهی سبک BITFA\n\n"
-            "تیکر، آدرس یا متن واچ‌لیست بفرست.\n"
-            "سیستم از Dex + CoinGecko استفاده می‌کند (میم و ارزهای رتبه‌دار)."
+            "• تیکر / آدرس / متن واچ‌لیست بفرست\n"
+            "• یا /scan برای اسکن آخرین پیام‌های کانال @bitfa"
         )
         return Response(status_code=200)
 
     if text.startswith("/help"):
-        send_telegram_message(chat_id, "تیکر / آدرس / متن واچ‌لیست را بفرست.")
+        send_telegram_message(
+            chat_id,
+            "دستورات:\n"
+            "/scan — خواندن تیکرهای اخیر کانال BITFA و امتیازدهی\n"
+            "یا مستقیم تیکر/آدرس/متن واچ‌لیست بفرست."
+        )
+        return Response(status_code=200)
+
+    if text.startswith("/scan"):
+        send_telegram_message(chat_id, "در حال اسکن کانال @bitfa ... ⏳\nممکن است ۳۰–۹۰ ثانیه طول بکشد.")
+        try:
+            from channel_scanner import scan_and_score
+            result = await scan_and_score(limit_messages=40)
+            send_telegram_message(chat_id, format_scan(result))
+        except Exception as e:
+            logger.exception("scan failed")
+            send_telegram_message(chat_id, f"خطا در /scan:\n{str(e)[:300]}")
         return Response(status_code=200)
 
     if text.startswith("/"):
