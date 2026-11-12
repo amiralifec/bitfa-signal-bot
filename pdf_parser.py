@@ -1,5 +1,5 @@
 """
-استخراج تیکر از PDF واچ‌لیست BITFA
+استخراج تیکر از PDF واچ‌لیست BITFA - نسخه تمیزتر
 """
 
 import re
@@ -17,8 +17,11 @@ STOPWORDS = {
     "SUPPORT", "RESISTANCE", "BREAKOUT", "PULLBACK", "WATCH", "LIST",
     "SIGNAL", "FUTURES", "SPOT", "DEX", "CEX", "SOL", "BSC", "BASE",
     "UPDATE", "NOTE", "WARNING", "DISCLAIMER", "PDF", "HTML",
-    "NOV", "OKX", "MEXC", "GATE", "LBank", "KuCoin", "Bitget", "Toobit",
-    "Bitunix", "XT", "COM", "CPU", "GPU", "ETF", "AI", "HTTP", "HTTPS"
+    "NOV", "OKX", "MEXC", "GATE", "LBANK", "KUCOIN", "BITGET", "TOOBIT",
+    "BITUNIX", "XT", "COM", "CPU", "GPU", "ETF", "AI", "HTTP", "HTTPS",
+    "WWW", "THE", "AND", "FOR", "WITH", "FROM", "THIS", "THAT",
+    "SK", "MH", "NAP", "NULL", "TRUE", "FALSE", "AMDUSDT", "PERP",
+    "GRANITESHARES", "ADVANCED", "MICRO", "DEVICES"
 }
 
 
@@ -39,52 +42,48 @@ def extract_text_from_pdf_bytes(data: bytes) -> str:
         return ""
 
 
-def extract_tickers_from_text(text: str) -> List[str]:
+def extract_tickers_from_text(text: str, strict: bool = False) -> List[str]:
+    """
+    strict=True: فقط نمادهای با #
+    strict=False: هشتگ‌ها اول، بعد نمادهای واضح
+    """
     if not text:
         return []
 
-    found: List[str] = []
+    hashed: List[str] = []
     seen: Set[str] = set()
 
-    # الگوهای رایج در PDF بیتفا: #AMD  یا  AMD#  یا نماد داخل باکس
-    patterns = [
-        r"#\s*([A-Za-z][A-Za-z0-9]{1,14})",
-        r"([A-Za-z][A-Za-z0-9]{1,14})\s*#",
-        r"\b([A-Z]{2,12})\b",
-    ]
-
-    for pat in patterns:
-        for m in re.finditer(pat, text):
-            t = m.group(1).upper().strip()
-            if not t or t in STOPWORDS:
-                continue
-            if len(t) < 2 or len(t) > 15:
-                continue
-            # فیلتر کلمات فارسی‌مانند / اعداد خالص
-            if not re.match(r"^[A-Z][A-Z0-9]*$", t):
-                continue
-            if t not in seen:
-                seen.add(t)
-                found.append(t)
-
-    # اولویت به مواردی که با # آمده‌اند
-    hashed = []
     for m in re.finditer(r"#\s*([A-Za-z][A-Za-z0-9]{1,14})|([A-Za-z][A-Za-z0-9]{1,14})\s*#", text):
-        t = (m.group(1) or m.group(2) or "").upper()
-        if t and t not in STOPWORDS and t not in hashed:
+        t = (m.group(1) or m.group(2) or "").upper().strip()
+        if not t or t in STOPWORDS:
+            continue
+        if not re.match(r"^[A-Z][A-Z0-9]{1,14}$", t):
+            continue
+        if t not in seen:
+            seen.add(t)
             hashed.append(t)
 
-    if hashed:
-        # ابتدا هشتگ‌دارها، بعد بقیه
-        rest = [t for t in found if t not in hashed]
-        return (hashed + rest)[:20]
+    if strict or hashed:
+        return hashed[:20]
 
-    return found[:20]
+    # فقط اگر هشتگ نبود، سراغ نمادهای جدا
+    extra: List[str] = []
+    for m in re.finditer(r"\b([A-Z]{2,10})\b", text):
+        t = m.group(1).upper()
+        if t in STOPWORDS or t in seen:
+            continue
+        if len(t) < 2:
+            continue
+        seen.add(t)
+        extra.append(t)
+
+    return (hashed + extra)[:20]
 
 
 def parse_watchlist_pdf(data: bytes) -> dict:
     text = extract_text_from_pdf_bytes(data)
-    tickers = extract_tickers_from_text(text)
+    # در PDF اولویت با هشتگ
+    tickers = extract_tickers_from_text(text, strict=False)
     return {
         "tickers": tickers,
         "text_preview": (text or "")[:500],

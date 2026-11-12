@@ -1,13 +1,12 @@
 """
 BITFA Scorer + Telegram Bot
-نسخه ۱.۱.۱ - جلوگیری از پاسخ‌های تکراری /scan
+نسخه ۱.۲ - /scan تمیزتر (PDF-اول + خروجی مرتب)
 """
 
 import os
 import re
 import logging
 import asyncio
-import time
 from fastapi import FastAPI, Request, Response
 from pydantic import BaseModel
 from typing import Optional, List, Set
@@ -23,9 +22,8 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_BASE = os.getenv("RENDER_EXTERNAL_URL") or "https://bitfa-signal-bot.onrender.com"
 
-app = FastAPI(title="BITFA Signal Scorer", version="1.1.1")
+app = FastAPI(title="BITFA Signal Scorer", version="1.2.0")
 
-# جلوگیری از اسکن همزمان و پردازش تکراری آپدیت
 _scan_locks: Set[int] = set()
 _processed_updates: Set[int] = set()
 _processed_max = 500
@@ -191,12 +189,12 @@ def format_scan(data: dict) -> str:
 
     lines = [
         "📡 *اسکن کانال BITFA*",
-        f"پیام‌های بررسی‌شده: {data.get('messages_checked', 0)}",
-        f"PDFهای خوانده‌شده: {data.get('pdfs_parsed', 0)}",
-        f"تیکرهای پیدا شده: {len(data.get('tickers_found') or [])}",
+        f"پیام: {data.get('messages_checked', 0)} | PDF: {data.get('pdfs_parsed', 0)} | تیکر: {len(data.get('tickers_found') or [])}",
         "",
     ]
+
     summary = data.get("summary") or {}
+    # اول دسته‌های مهم
     if summary.get("HOT"):
         lines.append("🔥 *HOT:* " + ", ".join(summary["HOT"]))
     if summary.get("QUALIFIED"):
@@ -204,38 +202,50 @@ def format_scan(data: dict) -> str:
     if summary.get("WATCH"):
         lines.append("👀 *WATCH:* " + ", ".join(summary["WATCH"]))
     if summary.get("SKIP"):
-        lines.append("❌ *SKIP:* " + ", ".join(summary["SKIP"]))
+        # فقط خلاصه کوتاه SKIP
+        skip_show = summary["SKIP"][:5]
+        extra = len(summary["SKIP"]) - len(skip_show)
+        skip_line = ", ".join(skip_show)
+        if extra > 0:
+            skip_line += f" …(+{extra})"
+        lines.append("❌ *SKIP:* " + skip_line)
 
-    lines.append("\n────────────\n*جزئیات (حداکثر ۱۲ تا):*\n")
+    lines.append("\n────────────\n*جزئیات (مرتب‌شده بر اساس امتیاز):*\n")
     for item in (data.get("results") or []):
         t = item.get("ticker")
         r = item.get("result") or {}
         lines.append(format_single(t, r))
         lines.append("")
 
-    lines.append("_دستور: /scan_\n_NFA | DYOR_")
+    lines.append("_اولویت با PDF واچ‌لیست_\n_دستور: /scan_\n_NFA | DYOR_")
     return "\n".join(lines)
 
 
 def score_ticker_list(tickers: List[str]) -> dict:
     results = []
     summary = {"HOT": [], "QUALIFIED": [], "WATCH": [], "SKIP": []}
-    for t in tickers[:12]:
+    rows = []
+    for t in tickers[:15]:
         try:
             r = analyze_token(symbol=t)
-            results.append({"ticker": t, "result": r})
-            cat = r.get("category", "SKIP")
-            if cat in summary:
-                summary[cat].append(f"#{t} ({r.get('score', 0)})")
+            rows.append((int(r.get("score") or 0), t, r))
         except Exception as e:
-            results.append({"ticker": t, "result": {"error": str(e)[:100], "score": 0, "category": "SKIP"}})
-            summary["SKIP"].append(f"#{t}")
+            rows.append((0, t, {"error": str(e)[:100], "score": 0, "category": "SKIP", "token": t}))
+    rows.sort(key=lambda x: x[0], reverse=True)
+    for score, t, r in rows:
+        cat = r.get("category", "SKIP")
+        if cat not in summary:
+            cat = "SKIP"
+        summary[cat].append(f"#{r.get('token') or t} ({score})")
+        results.append({"ticker": t, "result": r})
+    focus = [x for x in results if x["result"].get("category") in ("HOT", "QUALIFIED", "WATCH")]
+    skips = [x for x in results if x["result"].get("category") == "SKIP"][:4]
     return {
         "messages_checked": 0,
         "pdfs_parsed": 1,
         "tickers_found": tickers,
         "summary": summary,
-        "results": results,
+        "results": focus + skips,
     }
 
 
@@ -268,7 +278,6 @@ def download_telegram_file(file_id: str) -> bytes:
 
 
 async def run_scan_job(chat_id: int):
-    """اجرای اسکن در پس‌زمینه تا وب‌هوک سریع ۲۰۰ برگرداند"""
     if chat_id in _scan_locks:
         send_telegram_message(chat_id, "یک اسکن در حال اجراست. لطفاً صبر کن.")
         return
@@ -288,15 +297,15 @@ async def run_scan_job(chat_id: int):
 def root():
     return {
         "status": "ok",
-        "version": "1.1.1",
-        "message": "BITFA Scorer + /scan + PDF (no duplicate replies)",
+        "version": "1.2.0",
+        "message": "BITFA Scorer - clean /scan (PDF-first)",
         "bot": "enabled" if BOT_TOKEN else "disabled"
     }
 
 
 @app.get("/health")
 def health():
-    return {"status": "healthy", "version": "1.1.1"}
+    return {"status": "healthy", "version": "1.2.0"}
 
 
 @app.post("/analyze")
@@ -316,14 +325,12 @@ async def telegram_webhook(request: Request):
     except Exception:
         return Response(status_code=200)
 
-    # جلوگیری از پردازش تکراری همان update_id (retry تلگرام)
     update_id = data.get("update_id")
     if update_id is not None:
         if update_id in _processed_updates:
             return Response(status_code=200)
         _processed_updates.add(update_id)
         if len(_processed_updates) > _processed_max:
-            # پاکسازی ساده
             for _ in range(100):
                 try:
                     _processed_updates.pop()
@@ -337,7 +344,6 @@ async def telegram_webhook(request: Request):
     chat_id = message["chat"]["id"]
     text = (message.get("text") or message.get("caption") or "").strip()
 
-    # آپلود PDF
     doc = message.get("document")
     if doc:
         file_name = (doc.get("file_name") or "").lower()
@@ -367,7 +373,7 @@ async def telegram_webhook(request: Request):
             "سلام 👋\nربات امتیازدهی سبک BITFA\n\n"
             "• تیکر / آدرس / متن واچ‌لیست بفرست\n"
             "• PDF واچ‌لیست را مستقیم بفرست\n"
-            "• /scan برای اسکن کانال @bitfa (متن + PDF)"
+            "• /scan اسکن تمیز کانال (اولویت PDF)"
         )
         return Response(status_code=200)
 
@@ -375,7 +381,7 @@ async def telegram_webhook(request: Request):
         send_telegram_message(
             chat_id,
             "دستورات:\n"
-            "/scan — خواندن پیام و PDFهای اخیر کانال BITFA\n"
+            "/scan — اسکن تمیز کانال BITFA (PDF اول)\n"
             "یا تیکر/آدرس/متن/فایل PDF بفرست."
         )
         return Response(status_code=200)
@@ -385,8 +391,7 @@ async def telegram_webhook(request: Request):
             send_telegram_message(chat_id, "یک اسکن در حال اجراست. لطفاً صبر کن.")
             return Response(status_code=200)
 
-        send_telegram_message(chat_id, "در حال اسکن کانال @bitfa (متن + PDF)... ⏳\nممکن است تا ۲ دقیقه طول بکشد.")
-        # پردازش در پس‌زمینه — فوراً ۲۰۰ برمی‌گردانیم تا تلگرام retry نکند
+        send_telegram_message(chat_id, "در حال اسکن تمیز کانال @bitfa (اولویت PDF)... ⏳")
         asyncio.create_task(run_scan_job(chat_id))
         return Response(status_code=200)
 
@@ -431,7 +436,7 @@ async def telegram_webhook(request: Request):
     if summary["WATCH"]:
         lines.append("👀 *WATCH:* " + ", ".join(summary["WATCH"]))
     if summary["SKIP"]:
-        lines.append("❌ *SKIP:* " + ", ".join(summary["SKIP"]))
+        lines.append("❌ *SKIP:* " + ", ".join(summary["SKIP"][:6]))
     lines.append("\n────────────\n*جزئیات:*\n")
     for name, result in results:
         lines.append(format_single(name, result))
@@ -449,7 +454,6 @@ def set_webhook():
     webhook_url = f"{WEBHOOK_BASE.rstrip('/')}/telegram-webhook"
     api = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook"
     try:
-        # drop_pending_updates کمک می‌کند صف قدیمی تکرار نشود
         r = http_requests.post(
             api,
             json={"url": webhook_url, "drop_pending_updates": True},
