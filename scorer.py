@@ -1,6 +1,6 @@
 """
-BITFA Signal Scorer - Version 0.8.1
-رفع انتخاب جفت اشتباه + اولویت جفت فعال با تغییر قیمت واقعی
+BITFA Signal Scorer - Version 0.8.2
+نمایش نماد + قیمت لحظه‌ای برای اطمینان از هویت ارز
 """
 
 import requests
@@ -49,18 +49,10 @@ def pair_age_hours(pair: Dict) -> Optional[float]:
 
 
 def select_best_pair(pairs: List[Dict], query_symbol: str = None) -> Optional[Dict]:
-    """
-    انتخاب هوشمند:
-    1. اگر تیکر داده شده، فقط جفت‌هایی که baseToken.symbol دقیقاً مطابقت دارد
-    2. اولویت با جفت دارای حجم واقعی + لیکوئیدیتی
-    3. جفت‌های مرده را حذف کن
-    """
     if not pairs:
         return None
 
     candidates = pairs
-
-    # فیلتر نماد دقیق
     if query_symbol:
         q = query_symbol.strip().upper()
         exact = []
@@ -78,25 +70,18 @@ def select_best_pair(pairs: List[Dict], query_symbol: str = None) -> Optional[Di
         vol = safe_float((p.get("volume") or {}).get("h24", 0))
         chg = (p.get("priceChange") or {}).get("h24")
 
-        # جفت تقریباً مرده
         if liq < 2000 and vol < 500:
             continue
 
-        # امتیاز ترکیبی
         pair_score = liq * 0.4 + vol * 0.6
-
-        # اگر تغییر قیمت معتبر دارد کمی پاداش بده
         if chg is not None:
             pair_score *= 1.15
-
-        # جفت با حجم خیلی کم نسبت به لیکوئیدیتی تنزل
         if liq > 0 and vol / liq < 0.05 and vol < 20000:
             pair_score *= 0.5
 
         scored.append((pair_score, p))
 
     if not scored:
-        # اگر همه فیلتر شدند، از بین همان candidates بالاترین لیکوئیدیتی
         return max(candidates, key=lambda p: safe_float((p.get("liquidity") or {}).get("usd", 0)))
 
     scored.sort(key=lambda x: x[0], reverse=True)
@@ -143,12 +128,12 @@ def calculate_score(data: Dict, symbol: str = None) -> Dict[str, Any]:
     liquidity = safe_float((pair.get("liquidity") or {}).get("usd", 0))
     volume_24h = safe_float((pair.get("volume") or {}).get("h24", 0))
 
-    # تغییر قیمت: اگر None بود، ننویس 0 گمراه‌کننده
     raw_chg_24h = (pair.get("priceChange") or {}).get("h24")
     raw_chg_1h = (pair.get("priceChange") or {}).get("h1")
     price_change_24h = safe_float(raw_chg_24h, default=None) if raw_chg_24h is not None else None
     price_change_1h = safe_float(raw_chg_1h, default=None) if raw_chg_1h is not None else None
 
+    price_usd = safe_float(pair.get("priceUsd"), default=None)
     fdv = safe_float(pair.get("fdv", 0))
     market_cap = safe_float(pair.get("marketCap", 0)) or fdv
     txns = (pair.get("txns") or {}).get("h24", {}) or {}
@@ -156,7 +141,10 @@ def calculate_score(data: Dict, symbol: str = None) -> Dict[str, Any]:
     sells = safe_float(txns.get("sells", 0))
     chain = pair.get("chainId", "unknown")
     dex = pair.get("dexId", "unknown")
-    base_sym = ((pair.get("baseToken") or {}).get("symbol") or symbol or "?").upper()
+    base = pair.get("baseToken") or {}
+    base_sym = (base.get("symbol") or symbol or "?").upper()
+    base_name = base.get("name") or ""
+    token_address = base.get("address") or ""
     age_h = pair_age_hours(pair)
 
     if liquidity > 0: confidence += 15
@@ -285,7 +273,6 @@ def calculate_score(data: Dict, symbol: str = None) -> Dict[str, Any]:
             score -= 5
             warnings.append(f"فشار فروش ۱ ساعته: {price_change_1h:.1f}%")
 
-    # Buy pressure + age (16)
     total_tx = buys + sells
     if total_tx > 20:
         buy_ratio = buys / total_tx
@@ -347,6 +334,16 @@ def calculate_score(data: Dict, symbol: str = None) -> Dict[str, Any]:
     else:
         position_suggestion = "حداکثر ۳٪ تا ۴٪ از کل سرمایه"
 
+    # فرمت قیمت خوانا
+    if price_usd is None:
+        price_str = None
+    elif price_usd >= 1:
+        price_str = f"${price_usd:,.4f}"
+    elif price_usd >= 0.01:
+        price_str = f"${price_usd:.6f}"
+    else:
+        price_str = f"${price_usd:.8f}"
+
     return {
         "score": score,
         "category": category,
@@ -356,6 +353,10 @@ def calculate_score(data: Dict, symbol: str = None) -> Dict[str, Any]:
         "confidence": confidence,
         "position_suggestion": position_suggestion,
         "token": base_sym,
+        "token_name": base_name,
+        "token_address": token_address,
+        "price_usd": price_usd,
+        "price_str": price_str,
         "reasons": reasons,
         "warnings": warnings,
         "metrics": {
@@ -369,7 +370,7 @@ def calculate_score(data: Dict, symbol: str = None) -> Dict[str, Any]:
             "chain": chain,
             "dex": dex
         },
-        "note": "نسخه ۰.۸.۱ | انتخاب جفت اصلاح‌شده | NFA | DYOR"
+        "note": "نسخه ۰.۸.۲ | نماد + قیمت لحظه‌ای | NFA | DYOR"
     }
 
 
