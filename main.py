@@ -1,6 +1,6 @@
 """
 BITFA Scorer + Telegram Bot
-نسخه ۰.۸.۲ - نمایش نماد (#OPG) و قیمت لحظه‌ای
+نسخه ۰.۹ - خروجی ترکیبی Dex + CoinGecko با رتبه و لینک
 """
 
 import os
@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_BASE = os.getenv("RENDER_EXTERNAL_URL") or "https://bitfa-signal-bot.onrender.com"
 
-app = FastAPI(title="BITFA Signal Scorer", version="0.8.2")
+app = FastAPI(title="BITFA Signal Scorer", version="0.9.0")
 
 STOPWORDS = {
     "BITFA", "WATCHLIST", "NFA", "DYOR", "USDT", "USD", "BTC", "ETH",
@@ -76,26 +76,24 @@ def extract_tickers_and_addresses(text: str) -> List[str]:
         if key not in seen:
             seen.add(key)
             unique.append(i)
-    return unique[:15]
+    return unique[:12]
 
 
 def format_single(name: str, result: dict) -> str:
     if result.get("error"):
         return f"*{name}* → خطا: {result.get('error')}"
-
     token = result.get("token") or name
     price_str = result.get("price_str") or "-"
     score = result.get("score", 0)
     category = result.get("category", "-")
     action = result.get("action", "-")
     risk = result.get("risk_level", "-")
-    pos = result.get("position_suggestion", "-")
+    rank = result.get("rank")
     cat_emoji = {"HOT": "🔥", "QUALIFIED": "✅", "WATCH": "👀", "SKIP": "❌"}.get(category, "▪️")
-
+    rank_txt = f" | رتبه #{rank}" if rank else ""
     return (
-        f"{cat_emoji} *#{token}* | {price_str}\n"
-        f"{score}/100 | {category} | {action}\n"
-        f"ریسک: {risk} | حجم: {pos}"
+        f"{cat_emoji} *#{token}* | {price_str}{rank_txt}\n"
+        f"{score}/100 | {category} | {action} | ریسک: {risk}"
     )
 
 
@@ -106,6 +104,7 @@ def format_full(result: dict) -> str:
     token = result.get("token") or "?"
     token_name = result.get("token_name") or ""
     price_str = result.get("price_str") or "-"
+    rank = result.get("rank")
     score = result.get("score", 0)
     category = result.get("category", "-")
     rec = result.get("recommendation", "-")
@@ -116,32 +115,37 @@ def format_full(result: dict) -> str:
     reasons = result.get("reasons", [])
     warnings = result.get("warnings", [])
     metrics = result.get("metrics", {})
+    links = result.get("links") or {}
 
     cat_emoji = {"HOT": "🔥", "QUALIFIED": "✅", "WATCH": "👀", "SKIP": "❌"}.get(category, "▪️")
-
     title = f"#{token}"
     if token_name:
         title += f" ({token_name})"
 
     lines = [
         f"{cat_emoji} *نتیجه تحلیل*",
-        f"",
+        "",
         f"🪙 *ارز:* {title}",
         f"💵 *قیمت لحظه‌ای:* {price_str}",
-        f"",
+    ]
+    if rank:
+        lines.append(f"🏅 *رتبه مارکت‌کپ:* #{rank}")
+
+    lines += [
+        "",
         f"📊 *امتیاز:* {score}/100",
         f"🏷 *دسته:* {category}",
         f"⚡ *اقدام:* {action}",
         f"⚠️ *ریسک:* {risk}",
         f"🎯 *اعتماد:* {conf}%",
         f"💰 *پیشنهاد حجم:* {pos}",
-        f"",
+        "",
         f"📝 *توصیه:*\n{rec}",
     ]
 
     if reasons:
         lines.append("\n✅ *نکات:*")
-        for r in reasons[:5]:
+        for r in reasons[:6]:
             lines.append(f"• {r}")
 
     if warnings:
@@ -151,16 +155,23 @@ def format_full(result: dict) -> str:
 
     if metrics:
         lines.append("\n📈 *متریک‌ها:*")
-        if metrics.get("liquidity_usd") is not None:
-            lines.append(f"• لیکوئیدیتی: ${metrics['liquidity_usd']:,.0f}")
-        if metrics.get("volume_24h") is not None:
-            lines.append(f"• حجم ۲۴س: ${metrics['volume_24h']:,.0f}")
-        if metrics.get("market_cap") is not None:
+        if metrics.get("liquidity_usd"):
+            lines.append(f"• لیکوئیدیتی دکس: ${metrics['liquidity_usd']:,.0f}")
+        if metrics.get("volume_24h"):
+            lines.append(f"• حجم (تقریبی): ${metrics['volume_24h']:,.0f}")
+        if metrics.get("market_cap"):
             lines.append(f"• مارکت‌کپ: ${metrics['market_cap']:,.0f}")
         if metrics.get("price_change_24h") is not None:
             lines.append(f"• تغییر ۲۴س: {metrics['price_change_24h']}%")
         if metrics.get("chain"):
-            lines.append(f"• زنجیره: {metrics['chain']}")
+            lines.append(f"• زنجیره دکس: {metrics['chain']}")
+
+    if links.get("coingecko") or links.get("dexscreener"):
+        lines.append("\n🔗 *لینک بررسی:*")
+        if links.get("coingecko"):
+            lines.append(f"• CoinGecko: {links['coingecko']}")
+        if links.get("dexscreener"):
+            lines.append(f"• DexScreener: {links['dexscreener']}")
 
     lines.append("\n_NFA | DYOR_")
     return "\n".join(lines)
@@ -172,7 +183,7 @@ def send_telegram_message(chat_id: int, text: str):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     if len(text) > 4000:
         text = text[:3900] + "\n\n... (خلاصه شده)"
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown", "disable_web_page_preview": True}
     try:
         http_requests.post(url, json=payload, timeout=15)
     except Exception as e:
@@ -183,15 +194,15 @@ def send_telegram_message(chat_id: int, text: str):
 def root():
     return {
         "status": "ok",
-        "version": "0.8.2",
-        "message": "BITFA Scorer - symbol + live price",
+        "version": "0.9.0",
+        "message": "BITFA Scorer hybrid Dex + CoinGecko",
         "bot": "enabled" if BOT_TOKEN else "disabled"
     }
 
 
 @app.get("/health")
 def health():
-    return {"status": "healthy", "version": "0.8.2"}
+    return {"status": "healthy", "version": "0.9.0"}
 
 
 @app.post("/analyze")
@@ -205,7 +216,6 @@ def analyze(req: AnalyzeRequest):
 async def telegram_webhook(request: Request):
     if not BOT_TOKEN:
         return Response(status_code=200)
-
     try:
         data = await request.json()
     except Exception:
@@ -217,7 +227,6 @@ async def telegram_webhook(request: Request):
 
     chat_id = message["chat"]["id"]
     text = (message.get("text") or "").strip()
-
     if not text:
         return Response(status_code=200)
 
@@ -226,12 +235,12 @@ async def telegram_webhook(request: Request):
             chat_id,
             "سلام 👋\nربات امتیازدهی سبک BITFA\n\n"
             "تیکر، آدرس یا متن واچ‌لیست بفرست.\n"
-            "خروجی شامل نماد (#OPG) و قیمت لحظه‌ای است."
+            "سیستم از Dex + CoinGecko استفاده می‌کند (میم و ارزهای رتبه‌دار)."
         )
         return Response(status_code=200)
 
     if text.startswith("/help"):
-        send_telegram_message(chat_id, "تیکر یا آدرس یا متن واچ‌لیست را بفرست.")
+        send_telegram_message(chat_id, "تیکر / آدرس / متن واچ‌لیست را بفرست.")
         return Response(status_code=200)
 
     if text.startswith("/"):
@@ -253,7 +262,6 @@ async def telegram_webhook(request: Request):
                 result = analyze_token(address=item)
             else:
                 result = analyze_token(symbol=item.upper())
-
             name = result.get("token") or item
             results.append((name, result))
             cat = result.get("category", "SKIP")
@@ -277,12 +285,10 @@ async def telegram_webhook(request: Request):
         lines.append("👀 *WATCH:* " + ", ".join(summary["WATCH"]))
     if summary["SKIP"]:
         lines.append("❌ *SKIP:* " + ", ".join(summary["SKIP"]))
-
     lines.append("\n────────────\n*جزئیات:*\n")
     for name, result in results:
         lines.append(format_single(name, result))
         lines.append("")
-
     lines.append("_NFA | DYOR_")
     send_telegram_message(chat_id, "\n".join(lines))
     return Response(status_code=200)
