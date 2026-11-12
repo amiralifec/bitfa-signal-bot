@@ -1,6 +1,6 @@
 """
 BITFA Scorer + Telegram Bot
-نسخه ۱.۲ - /scan تمیزتر (PDF-اول + خروجی مرتب)
+نسخه ۱.۳ - جداسازی سهام/پرپ از کریپتو در خروجی اسکن
 """
 
 import os
@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_BASE = os.getenv("RENDER_EXTERNAL_URL") or "https://bitfa-signal-bot.onrender.com"
 
-app = FastAPI(title="BITFA Signal Scorer", version="1.2.0")
+app = FastAPI(title="BITFA Signal Scorer", version="1.3.0")
 
 _scan_locks: Set[int] = set()
 _processed_updates: Set[int] = set()
@@ -95,10 +95,12 @@ def format_single(name: str, result: dict) -> str:
     action = result.get("action", "-")
     risk = result.get("risk_level", "-")
     rank = result.get("rank")
+    kind = result.get("asset_kind") or "crypto"
     cat_emoji = {"HOT": "🔥", "QUALIFIED": "✅", "WATCH": "👀", "SKIP": "❌"}.get(category, "▪️")
     rank_txt = f" | رتبه #{rank}" if rank else ""
+    kind_txt = " | 🏛 سهام/پرپ" if str(kind).startswith("stock") else ""
     return (
-        f"{cat_emoji} *#{token}* | {price_str}{rank_txt}\n"
+        f"{cat_emoji} *#{token}* | {price_str}{rank_txt}{kind_txt}\n"
         f"{score}/100 | {category} | {action} | ریسک: {risk}"
     )
 
@@ -122,6 +124,7 @@ def format_full(result: dict) -> str:
     warnings = result.get("warnings", [])
     metrics = result.get("metrics", {})
     links = result.get("links") or {}
+    kind = result.get("asset_kind") or "crypto"
 
     cat_emoji = {"HOT": "🔥", "QUALIFIED": "✅", "WATCH": "👀", "SKIP": "❌"}.get(category, "▪️")
     title = f"#{token}"
@@ -134,6 +137,8 @@ def format_full(result: dict) -> str:
         f"🪙 *ارز:* {title}",
         f"💵 *قیمت لحظه‌ای:* {price_str}",
     ]
+    if str(kind).startswith("stock"):
+        lines.append("🏛 *نوع:* سهام / پرپ (نه آلت‌کوین معمولی)")
     if rank:
         lines.append(f"🏅 *رتبه مارکت‌کپ:* #{rank}")
 
@@ -194,7 +199,6 @@ def format_scan(data: dict) -> str:
     ]
 
     summary = data.get("summary") or {}
-    # اول دسته‌های مهم
     if summary.get("HOT"):
         lines.append("🔥 *HOT:* " + ", ".join(summary["HOT"]))
     if summary.get("QUALIFIED"):
@@ -202,7 +206,6 @@ def format_scan(data: dict) -> str:
     if summary.get("WATCH"):
         lines.append("👀 *WATCH:* " + ", ".join(summary["WATCH"]))
     if summary.get("SKIP"):
-        # فقط خلاصه کوتاه SKIP
         skip_show = summary["SKIP"][:5]
         extra = len(summary["SKIP"]) - len(skip_show)
         skip_line = ", ".join(skip_show)
@@ -210,12 +213,26 @@ def format_scan(data: dict) -> str:
             skip_line += f" …(+{extra})"
         lines.append("❌ *SKIP:* " + skip_line)
 
-    lines.append("\n────────────\n*جزئیات (مرتب‌شده بر اساس امتیاز):*\n")
+    crypto_rows = []
+    stock_rows = []
     for item in (data.get("results") or []):
-        t = item.get("ticker")
         r = item.get("result") or {}
-        lines.append(format_single(t, r))
-        lines.append("")
+        if str(r.get("asset_kind") or "").startswith("stock"):
+            stock_rows.append(item)
+        else:
+            crypto_rows.append(item)
+
+    if crypto_rows:
+        lines.append("\n────────────\n*کریپتو (مرتب‌شده):*\n")
+        for item in crypto_rows:
+            lines.append(format_single(item.get("ticker"), item.get("result") or {}))
+            lines.append("")
+
+    if stock_rows:
+        lines.append("────────────\n*🏛 سهام / پرپ (جدا از آلت):*\n")
+        for item in stock_rows:
+            lines.append(format_single(item.get("ticker"), item.get("result") or {}))
+            lines.append("")
 
     lines.append("_اولویت با PDF واچ‌لیست_\n_دستور: /scan_\n_NFA | DYOR_")
     return "\n".join(lines)
@@ -297,15 +314,15 @@ async def run_scan_job(chat_id: int):
 def root():
     return {
         "status": "ok",
-        "version": "1.2.0",
-        "message": "BITFA Scorer - clean /scan (PDF-first)",
+        "version": "1.3.0",
+        "message": "BITFA Scorer - stock/perp separated",
         "bot": "enabled" if BOT_TOKEN else "disabled"
     }
 
 
 @app.get("/health")
 def health():
-    return {"status": "healthy", "version": "1.2.0"}
+    return {"status": "healthy", "version": "1.3.0"}
 
 
 @app.post("/analyze")
@@ -373,7 +390,7 @@ async def telegram_webhook(request: Request):
             "سلام 👋\nربات امتیازدهی سبک BITFA\n\n"
             "• تیکر / آدرس / متن واچ‌لیست بفرست\n"
             "• PDF واچ‌لیست را مستقیم بفرست\n"
-            "• /scan اسکن تمیز کانال (اولویت PDF)"
+            "• /scan اسکن تمیز کانال (PDF اول + جداسازی سهام/پرپ)"
         )
         return Response(status_code=200)
 
@@ -381,7 +398,7 @@ async def telegram_webhook(request: Request):
         send_telegram_message(
             chat_id,
             "دستورات:\n"
-            "/scan — اسکن تمیز کانال BITFA (PDF اول)\n"
+            "/scan — اسکن تمیز کانال BITFA\n"
             "یا تیکر/آدرس/متن/فایل PDF بفرست."
         )
         return Response(status_code=200)
@@ -391,7 +408,7 @@ async def telegram_webhook(request: Request):
             send_telegram_message(chat_id, "یک اسکن در حال اجراست. لطفاً صبر کن.")
             return Response(status_code=200)
 
-        send_telegram_message(chat_id, "در حال اسکن تمیز کانال @bitfa (اولویت PDF)... ⏳")
+        send_telegram_message(chat_id, "در حال اسکن تمیز کانال @bitfa ... ⏳")
         asyncio.create_task(run_scan_job(chat_id))
         return Response(status_code=200)
 
