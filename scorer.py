@@ -1,11 +1,16 @@
 """
-BITFA Signal Scorer - Version 0.8.2
-نمایش نماد + قیمت لحظه‌ای برای اطمینان از هویت ارز
+BITFA Signal Scorer - Version 0.9.0
+ترکیبی: DexScreener (آن‌چین) + CoinGecko (بازار گسترده‌تر)
+مناسب هم میم‌دکس و هم ارزهای رتبه‌دار مثل ERA/Caldera
 """
 
+import os
 import requests
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 from datetime import datetime, timezone
+
+COINGECKO_KEY = os.getenv("COINGECKO_API_KEY", "")
+CG_BASE = "https://api.coingecko.com/api/v3"
 
 
 def safe_float(value, default=0.0):
@@ -15,6 +20,13 @@ def safe_float(value, default=0.0):
         return float(value)
     except:
         return default
+
+
+def cg_headers():
+    h = {"accept": "application/json"}
+    if COINGECKO_KEY:
+        h["x-cg-demo-api-key"] = COINGECKO_KEY
+    return h
 
 
 def get_dexscreener_data(token_address: str = None, symbol: str = None) -> Optional[Dict]:
@@ -31,6 +43,48 @@ def get_dexscreener_data(token_address: str = None, symbol: str = None) -> Optio
         return None
     except Exception as e:
         print(f"DexScreener error: {e}")
+        return None
+
+
+def coingecko_search(symbol: str) -> Optional[Dict]:
+    """جستجوی نماد در CoinGecko و برگرداندن بهترین تطبیق"""
+    try:
+        r = requests.get(f"{CG_BASE}/search", params={"query": symbol}, headers=cg_headers(), timeout=12)
+        if r.status_code != 200:
+            return None
+        coins = (r.json() or {}).get("coins") or []
+        symbol_u = symbol.upper()
+        # اول تطبیق دقیق نماد
+        exact = [c for c in coins if (c.get("symbol") or "").upper() == symbol_u]
+        pool = exact if exact else coins
+        if not pool:
+            return None
+        # ترجیح رتبه بهتر (عدد کمتر)
+        pool = sorted(pool, key=lambda c: c.get("market_cap_rank") or 999999)
+        return pool[0]
+    except Exception as e:
+        print(f"CG search error: {e}")
+        return None
+
+
+def coingecko_market(coin_id: str) -> Optional[Dict]:
+    try:
+        r = requests.get(
+            f"{CG_BASE}/coins/markets",
+            params={
+                "vs_currency": "usd",
+                "ids": coin_id,
+                "price_change_percentage": "1h,24h,7d"
+            },
+            headers=cg_headers(),
+            timeout=12
+        )
+        if r.status_code != 200:
+            return None
+        arr = r.json() or []
+        return arr[0] if arr else None
+    except Exception as e:
+        print(f"CG market error: {e}")
         return None
 
 
@@ -51,274 +105,272 @@ def pair_age_hours(pair: Dict) -> Optional[float]:
 def select_best_pair(pairs: List[Dict], query_symbol: str = None) -> Optional[Dict]:
     if not pairs:
         return None
-
     candidates = pairs
     if query_symbol:
         q = query_symbol.strip().upper()
-        exact = []
-        for p in pairs:
-            base = p.get("baseToken") or {}
-            sym = (base.get("symbol") or "").upper()
-            if sym == q:
-                exact.append(p)
+        exact = [p for p in pairs if ((p.get("baseToken") or {}).get("symbol") or "").upper() == q]
         if exact:
             candidates = exact
-
     scored = []
     for p in candidates:
         liq = safe_float((p.get("liquidity") or {}).get("usd", 0))
         vol = safe_float((p.get("volume") or {}).get("h24", 0))
         chg = (p.get("priceChange") or {}).get("h24")
-
-        if liq < 2000 and vol < 500:
+        if liq < 1500 and vol < 300:
             continue
-
         pair_score = liq * 0.4 + vol * 0.6
         if chg is not None:
             pair_score *= 1.15
-        if liq > 0 and vol / liq < 0.05 and vol < 20000:
+        if liq > 0 and vol / liq < 0.05 and vol < 15000:
             pair_score *= 0.5
-
         scored.append((pair_score, p))
-
     if not scored:
         return max(candidates, key=lambda p: safe_float((p.get("liquidity") or {}).get("usd", 0)))
-
     scored.sort(key=lambda x: x[0], reverse=True)
     return scored[0][1]
 
 
-def calculate_score(data: Dict, symbol: str = None) -> Dict[str, Any]:
+def format_price(price_usd: Optional[float]) -> Optional[str]:
+    if price_usd is None:
+        return None
+    if price_usd >= 1:
+        return f"${price_usd:,.4f}"
+    if price_usd >= 0.01:
+        return f"${price_usd:.6f}"
+    return f"${price_usd:.8f}"
+
+
+def calculate_score_from_metrics(
+    *,
+    liquidity: float,
+    volume_24h: float,
+    market_cap: float,
+    price_change_24h: Optional[float],
+    price_change_1h: Optional[float],
+    buys: float,
+    sells: float,
+    age_h: Optional[float],
+    has_rank: bool,
+    rank: Optional[int],
+) -> Tuple[int, List[str], List[str], str, int]:
     score = 0
-    reasons: List[str] = []
-    warnings: List[str] = []
-    confidence = 45
+    reasons = []
+    warnings = []
+    confidence = 40
     risk_base = "متوسط"
 
-    pairs = data.get("pairs") or []
-    if not pairs:
-        return {
-            "score": 0,
-            "category": "SKIP",
-            "recommendation": "رد - داده کافی نیست",
-            "action": "رد",
-            "risk_level": "نامشخص",
-            "confidence": 0,
-            "position_suggestion": "هیچ",
-            "reasons": ["هیچ جفت معاملاتی پیدا نشد"],
-            "warnings": [],
-            "metrics": {}
-        }
-
-    pair = select_best_pair(pairs, query_symbol=symbol)
-    if not pair:
-        return {
-            "score": 0,
-            "category": "SKIP",
-            "recommendation": "رد",
-            "action": "رد",
-            "risk_level": "نامشخص",
-            "confidence": 0,
-            "position_suggestion": "هیچ",
-            "reasons": ["جفت مناسب پیدا نشد"],
-            "warnings": [],
-            "metrics": {}
-        }
-
-    liquidity = safe_float((pair.get("liquidity") or {}).get("usd", 0))
-    volume_24h = safe_float((pair.get("volume") or {}).get("h24", 0))
-
-    raw_chg_24h = (pair.get("priceChange") or {}).get("h24")
-    raw_chg_1h = (pair.get("priceChange") or {}).get("h1")
-    price_change_24h = safe_float(raw_chg_24h, default=None) if raw_chg_24h is not None else None
-    price_change_1h = safe_float(raw_chg_1h, default=None) if raw_chg_1h is not None else None
-
-    price_usd = safe_float(pair.get("priceUsd"), default=None)
-    fdv = safe_float(pair.get("fdv", 0))
-    market_cap = safe_float(pair.get("marketCap", 0)) or fdv
-    txns = (pair.get("txns") or {}).get("h24", {}) or {}
-    buys = safe_float(txns.get("buys", 0))
-    sells = safe_float(txns.get("sells", 0))
-    chain = pair.get("chainId", "unknown")
-    dex = pair.get("dexId", "unknown")
-    base = pair.get("baseToken") or {}
-    base_sym = (base.get("symbol") or symbol or "?").upper()
-    base_name = base.get("name") or ""
-    token_address = base.get("address") or ""
-    age_h = pair_age_hours(pair)
-
-    if liquidity > 0: confidence += 15
-    if volume_24h > 0: confidence += 12
+    if liquidity > 0: confidence += 12
+    if volume_24h > 0: confidence += 10
     if market_cap > 0: confidence += 10
-    if age_h is not None: confidence += 10
-    if buys + sells > 8: confidence += 8
-    if price_change_24h is not None: confidence += 5
+    if price_change_24h is not None: confidence += 8
+    if has_rank: confidence += 12
+    if age_h is not None: confidence += 8
     confidence = min(100, confidence)
 
-    # Liquidity (24)
+    # Liquidity
     if liquidity >= 400000:
-        score += 24
-        reasons.append(f"لیکوئیدیتی عالی: ${liquidity:,.0f}")
+        score += 22; reasons.append(f"لیکوئیدیتی عالی: ${liquidity:,.0f}")
     elif liquidity >= 150000:
-        score += 19
-        reasons.append(f"لیکوئیدیتی خوب: ${liquidity:,.0f}")
-    elif liquidity >= 60000:
-        score += 13
-        reasons.append(f"لیکوئیدیتی قابل قبول: ${liquidity:,.0f}")
-    elif liquidity >= 20000:
-        score += 7
-        reasons.append(f"لیکوئیدیتی متوسط: ${liquidity:,.0f}")
-        warnings.append("لغزش متوسط ممکن است")
-    elif liquidity >= 8000:
-        score += 3
-        reasons.append(f"لیکوئیدیتی کم: ${liquidity:,.0f}")
-        warnings.append("لغزش بالا")
+        score += 17; reasons.append(f"لیکوئیدیتی خوب: ${liquidity:,.0f}")
+    elif liquidity >= 50000:
+        score += 12; reasons.append(f"لیکوئیدیتی قابل قبول: ${liquidity:,.0f}")
+    elif liquidity >= 15000:
+        score += 6; reasons.append(f"لیکوئیدیتی متوسط: ${liquidity:,.0f}"); warnings.append("لغزش متوسط ممکن است")
+    elif liquidity >= 5000:
+        score += 2; reasons.append(f"لیکوئیدیتی کم: ${liquidity:,.0f}"); warnings.append("لغزش بالا")
+    elif liquidity > 0:
+        reasons.append(f"لیکوئیدیتی خیلی کم: ${liquidity:,.0f}"); warnings.append("ریسک نقدشوندگی"); score -= 5
     else:
-        reasons.append(f"لیکوئیدیتی خیلی کم: ${liquidity:,.0f}")
-        warnings.append("ریسک نقدشوندگی خطرناک")
-        score -= 6
+        reasons.append("لیکوئیدیتی دکس نامشخص (ممکن است بیشتر CEX باشد)")
 
-    # Volume (22)
+    # Volume
     if volume_24h >= 800000:
-        score += 18
-        reasons.append(f"حجم بسیار بالا: ${volume_24h:,.0f}")
-    elif volume_24h >= 250000:
-        score += 14
-        reasons.append(f"حجم خوب: ${volume_24h:,.0f}")
-    elif volume_24h >= 80000:
-        score += 9
-        reasons.append(f"حجم متوسط رو به بالا: ${volume_24h:,.0f}")
-    elif volume_24h >= 25000:
-        score += 5
-        reasons.append(f"حجم متوسط: ${volume_24h:,.0f}")
-    elif volume_24h >= 8000:
-        score += 2
-        reasons.append(f"حجم کم: ${volume_24h:,.0f}")
+        score += 16; reasons.append(f"حجم بسیار بالا: ${volume_24h:,.0f}")
+    elif volume_24h >= 200000:
+        score += 12; reasons.append(f"حجم خوب: ${volume_24h:,.0f}")
+    elif volume_24h >= 60000:
+        score += 8; reasons.append(f"حجم متوسط رو به بالا: ${volume_24h:,.0f}")
+    elif volume_24h >= 20000:
+        score += 4; reasons.append(f"حجم متوسط: ${volume_24h:,.0f}")
+    elif volume_24h > 0:
+        score += 1; reasons.append(f"حجم کم: ${volume_24h:,.0f}")
     else:
-        reasons.append(f"حجم خیلی کم: ${volume_24h:,.0f}")
-        score -= 5
+        reasons.append("حجم دکس کم/نامشخص")
 
-    if liquidity > 0:
+    if liquidity > 0 and volume_24h > 0:
         vol_liq = volume_24h / liquidity
-        if vol_liq >= 2.5:
-            score += 6
-            reasons.append("نسبت حجم/لیکوئیدیتی قوی")
-        elif vol_liq >= 0.8:
-            score += 3
-            reasons.append("نسبت حجم/لیکوئیدیتی قابل قبول")
+        if vol_liq >= 2.0:
+            score += 5; reasons.append("نسبت حجم/لیکوئیدیتی قوی")
+        elif vol_liq >= 0.7:
+            score += 2
         elif vol_liq < 0.12:
-            score -= 10
-            warnings.append("حجم نسبت به لیکوئیدیتی بسیار ضعیف (جفت کم‌فعال)")
-        elif vol_liq < 0.30:
-            score -= 5
-            warnings.append("حجم نسبت به لیکوئیدیتی ضعیف است")
+            score -= 8; warnings.append("حجم نسبت به لیکوئیدیتی ضعیف")
 
-    # Market Cap (18)
-    if 0 < market_cap < 2_500_000:
-        score += 11
-        reasons.append(f"مارکت‌کپ خیلی کم: ${market_cap:,.0f}")
-        risk_base = "بالا"
-    elif 2_500_000 <= market_cap < 20_000_000:
-        score += 17
-        reasons.append(f"مارکت‌کپ مناسب (کم‌کپ): ${market_cap:,.0f}")
-        risk_base = "متوسط تا بالا"
-    elif 20_000_000 <= market_cap < 100_000_000:
-        score += 13
-        reasons.append(f"مارکت‌کپ متوسط: ${market_cap:,.0f}")
-        risk_base = "متوسط"
-    elif 100_000_000 <= market_cap < 500_000_000:
-        score += 7
-        reasons.append(f"مارکت‌کپ نسبتاً بالا: ${market_cap:,.0f}")
-        risk_base = "کم تا متوسط"
+    # Market cap / rank
+    if rank and rank <= 300:
+        score += 14; reasons.append(f"رتبه مارکت‌کپ خوب: #{rank}"); risk_base = "کم تا متوسط"
+    elif rank and rank <= 800:
+        score += 11; reasons.append(f"رتبه مارکت‌کپ متوسط: #{rank}"); risk_base = "متوسط"
+    elif rank and rank <= 2000:
+        score += 8; reasons.append(f"رتبه مارکت‌کپ: #{rank}"); risk_base = "متوسط تا بالا"
+    elif 0 < market_cap < 2_500_000:
+        score += 10; reasons.append(f"مارکت‌کپ خیلی کم: ${market_cap:,.0f}"); risk_base = "بالا"
+    elif 2_500_000 <= market_cap < 25_000_000:
+        score += 15; reasons.append(f"مارکت‌کپ مناسب (کم‌کپ): ${market_cap:,.0f}"); risk_base = "متوسط تا بالا"
+    elif 25_000_000 <= market_cap < 150_000_000:
+        score += 12; reasons.append(f"مارکت‌کپ متوسط: ${market_cap:,.0f}"); risk_base = "متوسط"
+    elif market_cap >= 150_000_000:
+        score += 7; reasons.append(f"مارکت‌کپ نسبتاً بالا: ${market_cap:,.0f}"); risk_base = "کم تا متوسط"
     else:
-        score += 2
-        reasons.append(f"مارکت‌کپ بالا: ${market_cap:,.0f}")
-        risk_base = "کم"
-        warnings.append("پتانسیل رشد انفجاری محدود")
+        reasons.append("مارکت‌کپ نامشخص")
 
-    if market_cap > 0 and liquidity > 0 and liquidity / market_cap < 0.025 and market_cap > 8_000_000:
-        score -= 5
-        warnings.append("لیکوئیدیتی نسبت به مارکت‌کپ پایین است")
-
-    # Momentum (20)
+    # Momentum
     if price_change_24h is None:
-        reasons.append("داده تغییر ۲۴ ساعته نامشخص")
-        score += 4
-    elif 8 <= price_change_24h <= 50:
-        score += 15
-        reasons.append(f"رشد ۲۴س معقول: {price_change_24h:.1f}%")
-    elif 50 < price_change_24h <= 110:
-        score += 10
-        reasons.append(f"رشد ۲۴س قوی: {price_change_24h:.1f}%")
-        warnings.append("رشد زیاد → احتمال نیاز به پولبک")
-    elif price_change_24h > 110:
-        score += 3
-        reasons.append(f"رشد بسیار زیاد: {price_change_24h:.1f}%")
-        warnings.append("احتمال FOMO و اصلاح")
+        reasons.append("تغییر ۲۴س نامشخص"); score += 3
+    elif 8 <= price_change_24h <= 55:
+        score += 14; reasons.append(f"رشد ۲۴س معقول: {price_change_24h:.1f}%")
+    elif 55 < price_change_24h <= 120:
+        score += 9; reasons.append(f"رشد ۲۴س قوی: {price_change_24h:.1f}%"); warnings.append("رشد زیاد → احتمال پولبک")
+    elif price_change_24h > 120:
+        score += 3; reasons.append(f"رشد بسیار زیاد: {price_change_24h:.1f}%"); warnings.append("احتمال FOMO")
     elif 0 <= price_change_24h < 8:
-        score += 8
-        reasons.append(f"نوسان ملایم: {price_change_24h:.1f}%")
+        score += 7; reasons.append(f"نوسان ملایم: {price_change_24h:.1f}%")
     elif -15 <= price_change_24h < 0:
-        score += 5
-        reasons.append(f"اصلاح خفیف (ممکن است پولبک): {price_change_24h:.1f}%")
+        score += 4; reasons.append(f"اصلاح خفیف: {price_change_24h:.1f}%")
     else:
-        reasons.append(f"ریزش: {price_change_24h:.1f}%")
-        warnings.append("فشار فروش")
+        reasons.append(f"ریزش: {price_change_24h:.1f}%"); warnings.append("فشار فروش")
 
     if price_change_1h is not None:
         if price_change_1h > 3:
-            score += 4
-            reasons.append(f"مومنتوم ۱س مثبت: {price_change_1h:.1f}%")
+            score += 3; reasons.append(f"مومنتوم ۱س مثبت: {price_change_1h:.1f}%")
         elif price_change_1h < -6:
-            score -= 5
-            warnings.append(f"فشار فروش ۱ ساعته: {price_change_1h:.1f}%")
+            score -= 4; warnings.append(f"فشار فروش ۱س: {price_change_1h:.1f}%")
 
     total_tx = buys + sells
     if total_tx > 20:
         buy_ratio = buys / total_tx
-        if buy_ratio >= 0.60:
-            score += 10
-            reasons.append(f"غلبه قوی خریداران: {buy_ratio*100:.0f}%")
-        elif buy_ratio >= 0.52:
-            score += 5
-            reasons.append("تعادل متمایل به خرید")
-        elif buy_ratio < 0.40:
-            score -= 5
-            warnings.append("غلبه فروشندگان")
-    elif total_tx > 0:
-        score += 2
+        if buy_ratio >= 0.58:
+            score += 8; reasons.append(f"غلبه خریداران: {buy_ratio*100:.0f}%")
+        elif buy_ratio < 0.42:
+            score -= 3; warnings.append("غلبه فروشندگان")
 
     if age_h is not None:
-        if age_h >= 24 * 45:
-            score += 5
-            reasons.append(f"جفت بالغ ({age_h/24:.0f} روز)")
-        elif age_h >= 24 * 7:
-            score += 3
-            reasons.append(f"جفت چندروزه ({age_h/24:.1f} روز)")
+        if age_h >= 24 * 30:
+            score += 4; reasons.append(f"جفت/بازار بالغ ({age_h/24:.0f} روز)")
         elif age_h < 4:
-            score -= 4
-            warnings.append(f"جفت بسیار جدید ({age_h:.1f} ساعت)")
+            score -= 3; warnings.append(f"بسیار جدید ({age_h:.1f} ساعت)")
 
     score = max(0, min(100, int(score)))
+    return score, reasons, warnings, risk_base, confidence
+
+
+def analyze_token(symbol: str = None, address: str = None) -> Dict[str, Any]:
+    dex_data = get_dexscreener_data(token_address=address, symbol=symbol)
+    pair = None
+    if dex_data and dex_data.get("pairs"):
+        pair = select_best_pair(dex_data.get("pairs") or [], query_symbol=symbol)
+
+    # استخراج از دکس
+    liquidity = volume_24h = market_cap = buys = sells = 0.0
+    price_change_24h = price_change_1h = price_usd = age_h = None
+    chain = dex = base_sym = base_name = token_address = ""
+    pair_url = None
+
+    if pair:
+        liquidity = safe_float((pair.get("liquidity") or {}).get("usd", 0))
+        volume_24h = safe_float((pair.get("volume") or {}).get("h24", 0))
+        raw24 = (pair.get("priceChange") or {}).get("h24")
+        raw1 = (pair.get("priceChange") or {}).get("h1")
+        price_change_24h = safe_float(raw24, None) if raw24 is not None else None
+        price_change_1h = safe_float(raw1, None) if raw1 is not None else None
+        price_usd = safe_float(pair.get("priceUsd"), None)
+        fdv = safe_float(pair.get("fdv", 0))
+        market_cap = safe_float(pair.get("marketCap", 0)) or fdv
+        txns = (pair.get("txns") or {}).get("h24", {}) or {}
+        buys = safe_float(txns.get("buys", 0))
+        sells = safe_float(txns.get("sells", 0))
+        chain = pair.get("chainId") or ""
+        dex = pair.get("dexId") or ""
+        base = pair.get("baseToken") or {}
+        base_sym = (base.get("symbol") or symbol or "?").upper()
+        base_name = base.get("name") or ""
+        token_address = base.get("address") or address or ""
+        age_h = pair_age_hours(pair)
+        # لینک دکس‌اسکرینر
+        pair_addr = pair.get("pairAddress")
+        if chain and pair_addr:
+            pair_url = f"https://dexscreener.com/{chain}/{pair_addr}"
+
+    # CoinGecko برای ارزهای شناخته‌شده‌تر
+    cg_hit = None
+    cg_mkt = None
+    rank = None
+    cg_url = None
+    search_sym = (base_sym if base_sym and base_sym != "?" else symbol) or None
+    if search_sym:
+        cg_hit = coingecko_search(search_sym)
+        if cg_hit:
+            cg_mkt = coingecko_market(cg_hit.get("id"))
+            if cg_mkt:
+                rank = cg_mkt.get("market_cap_rank")
+                # اگر دکس قیمت/مومنتوم ضعیف داد، از CG تکمیل کن
+                if price_usd is None:
+                    price_usd = safe_float(cg_mkt.get("current_price"), None)
+                if market_cap <= 0:
+                    market_cap = safe_float(cg_mkt.get("market_cap"), 0)
+                if price_change_24h is None:
+                    price_change_24h = safe_float(cg_mkt.get("price_change_percentage_24h"), None)
+                if price_change_1h is None:
+                    price_change_1h = safe_float(cg_mkt.get("price_change_percentage_1h_in_currency"), None)
+                if not base_name:
+                    base_name = cg_mkt.get("name") or cg_hit.get("name") or ""
+                if not base_sym or base_sym == "?":
+                    base_sym = (cg_mkt.get("symbol") or search_sym or "?").upper()
+                # حجم کلی بازار (نه فقط یک جفت دکس)
+                cg_vol = safe_float(cg_mkt.get("total_volume"), 0)
+                if cg_vol > volume_24h:
+                    volume_24h = max(volume_24h, cg_vol * 0.15)  # تقریبی برای امتیاز؛ حجم کامل CEX جداست
+                    reasons_note_vol = True
+                cg_url = f"https://www.coingecko.com/en/coins/{cg_hit.get('id')}"
+
+    if not pair and not cg_mkt:
+        return {
+            "error": "داده پیدا نشد (نه در دکس و نه در CoinGecko)",
+            "score": 0,
+            "category": "SKIP",
+            "recommendation": "رد",
+            "confidence": 0,
+            "position_suggestion": "هیچ"
+        }
+
+    score, reasons, warnings, risk_base, confidence = calculate_score_from_metrics(
+        liquidity=liquidity,
+        volume_24h=volume_24h,
+        market_cap=market_cap,
+        price_change_24h=price_change_24h,
+        price_change_1h=price_change_1h,
+        buys=buys,
+        sells=sells,
+        age_h=age_h,
+        has_rank=rank is not None,
+        rank=rank,
+    )
+
+    if rank:
+        reasons.insert(0, f"منبع بازار: CoinGecko + Dex" if pair else "منبع بازار: CoinGecko")
+    elif pair:
+        reasons.insert(0, "منبع بازار: عمدتاً DexScreener")
 
     if score >= 80 and confidence >= 70:
-        category = "HOT"
-        recommendation = "امتیاز عالی - قابل بررسی جدی برای ورود محدود"
-        action = "اولویت بررسی"
+        category, recommendation, action = "HOT", "امتیاز عالی - قابل بررسی جدی برای ورود محدود", "اولویت بررسی"
     elif score >= 65:
-        category = "QUALIFIED"
-        recommendation = "امتیاز خوب - مناسب بررسی با مدیریت ریسک سخت"
-        action = "بررسی برای ورود"
+        category, recommendation, action = "QUALIFIED", "امتیاز خوب - مناسب بررسی با مدیریت ریسک سخت", "بررسی برای ورود"
     elif score >= 48:
-        category = "WATCH"
-        recommendation = "امتیاز متوسط - فقط نظارت و انتظار تأیید ساختار"
-        action = "نظارت"
+        category, recommendation, action = "WATCH", "امتیاز متوسط - فقط نظارت و انتظار تأیید ساختار", "نظارت"
     else:
-        category = "SKIP"
-        recommendation = "امتیاز ضعیف - رد شود"
-        action = "رد"
+        category, recommendation, action = "SKIP", "امتیاز ضعیف - رد شود", "رد"
 
-    if risk_base == "بالا" or liquidity < 12000:
+    if risk_base == "بالا" or (liquidity > 0 and liquidity < 10000 and not rank):
         risk_level = "بالا"
     elif risk_base in ["متوسط تا بالا", "متوسط"]:
         risk_level = "متوسط"
@@ -334,16 +386,6 @@ def calculate_score(data: Dict, symbol: str = None) -> Dict[str, Any]:
     else:
         position_suggestion = "حداکثر ۳٪ تا ۴٪ از کل سرمایه"
 
-    # فرمت قیمت خوانا
-    if price_usd is None:
-        price_str = None
-    elif price_usd >= 1:
-        price_str = f"${price_usd:,.4f}"
-    elif price_usd >= 0.01:
-        price_str = f"${price_usd:.6f}"
-    else:
-        price_str = f"${price_usd:.8f}"
-
     return {
         "score": score,
         "category": category,
@@ -352,37 +394,26 @@ def calculate_score(data: Dict, symbol: str = None) -> Dict[str, Any]:
         "risk_level": risk_level,
         "confidence": confidence,
         "position_suggestion": position_suggestion,
-        "token": base_sym,
+        "token": base_sym or (symbol or "?").upper(),
         "token_name": base_name,
-        "token_address": token_address,
+        "token_address": token_address or address or "",
         "price_usd": price_usd,
-        "price_str": price_str,
+        "price_str": format_price(price_usd),
+        "rank": rank,
+        "links": {
+            "dexscreener": pair_url,
+            "coingecko": cg_url,
+        },
         "reasons": reasons,
         "warnings": warnings,
         "metrics": {
-            "liquidity_usd": round(liquidity),
-            "volume_24h": round(volume_24h),
-            "market_cap": round(market_cap),
+            "liquidity_usd": round(liquidity) if liquidity else 0,
+            "volume_24h": round(volume_24h) if volume_24h else 0,
+            "market_cap": round(market_cap) if market_cap else 0,
             "price_change_24h": round(price_change_24h, 2) if price_change_24h is not None else None,
             "price_change_1h": round(price_change_1h, 2) if price_change_1h is not None else None,
-            "buy_ratio": round(buys / total_tx, 2) if total_tx > 0 else None,
-            "pair_age_hours": round(age_h, 1) if age_h is not None else None,
-            "chain": chain,
-            "dex": dex
+            "chain": chain or None,
+            "dex": dex or None,
         },
-        "note": "نسخه ۰.۸.۲ | نماد + قیمت لحظه‌ای | NFA | DYOR"
+        "note": "نسخه ۰.۹ | Dex + CoinGecko | NFA | DYOR"
     }
-
-
-def analyze_token(symbol: str = None, address: str = None) -> Dict[str, Any]:
-    data = get_dexscreener_data(token_address=address, symbol=symbol)
-    if not data:
-        return {
-            "error": "داده پیدا نشد",
-            "score": 0,
-            "category": "SKIP",
-            "recommendation": "رد",
-            "confidence": 0,
-            "position_suggestion": "هیچ"
-        }
-    return calculate_score(data, symbol=symbol)
