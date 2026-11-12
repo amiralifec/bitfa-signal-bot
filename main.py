@@ -1,19 +1,21 @@
 """
 BITFA Scorer + Telegram Bot
-نسخه ۱.۱ - پشتیبانی از PDF واچ‌لیست در /scan و آپلود مستقیم
+نسخه ۱.۱.۱ - جلوگیری از پاسخ‌های تکراری /scan
 """
 
 import os
 import re
 import logging
+import asyncio
+import time
 from fastapi import FastAPI, Request, Response
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional, List, Set
 import uvicorn
 import requests as http_requests
 
 from scorer import analyze_token
-from pdf_parser import parse_watchlist_pdf, extract_tickers_from_text
+from pdf_parser import parse_watchlist_pdf
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -21,7 +23,12 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_BASE = os.getenv("RENDER_EXTERNAL_URL") or "https://bitfa-signal-bot.onrender.com"
 
-app = FastAPI(title="BITFA Signal Scorer", version="1.1.0")
+app = FastAPI(title="BITFA Signal Scorer", version="1.1.1")
+
+# جلوگیری از اسکن همزمان و پردازش تکراری آپدیت
+_scan_locks: Set[int] = set()
+_processed_updates: Set[int] = set()
+_processed_max = 500
 
 STOPWORDS = {
     "BITFA", "WATCHLIST", "NFA", "DYOR", "USDT", "USD", "BTC", "ETH",
@@ -246,7 +253,6 @@ def send_telegram_message(chat_id: int, text: str):
 
 
 def download_telegram_file(file_id: str) -> bytes:
-    # getFile
     r = http_requests.get(
         f"https://api.telegram.org/bot{BOT_TOKEN}/getFile",
         params={"file_id": file_id},
@@ -261,19 +267,36 @@ def download_telegram_file(file_id: str) -> bytes:
     return fr.content
 
 
+async def run_scan_job(chat_id: int):
+    """اجرای اسکن در پس‌زمینه تا وب‌هوک سریع ۲۰۰ برگرداند"""
+    if chat_id in _scan_locks:
+        send_telegram_message(chat_id, "یک اسکن در حال اجراست. لطفاً صبر کن.")
+        return
+    _scan_locks.add(chat_id)
+    try:
+        from channel_scanner import scan_and_score
+        result = await scan_and_score(limit_messages=40)
+        send_telegram_message(chat_id, format_scan(result))
+    except Exception as e:
+        logger.exception("scan failed")
+        send_telegram_message(chat_id, f"خطا در /scan:\n{str(e)[:300]}")
+    finally:
+        _scan_locks.discard(chat_id)
+
+
 @app.get("/")
 def root():
     return {
         "status": "ok",
-        "version": "1.1.0",
-        "message": "BITFA Scorer + /scan + PDF",
+        "version": "1.1.1",
+        "message": "BITFA Scorer + /scan + PDF (no duplicate replies)",
         "bot": "enabled" if BOT_TOKEN else "disabled"
     }
 
 
 @app.get("/health")
 def health():
-    return {"status": "healthy", "version": "1.1.0"}
+    return {"status": "healthy", "version": "1.1.1"}
 
 
 @app.post("/analyze")
@@ -287,10 +310,25 @@ def analyze(req: AnalyzeRequest):
 async def telegram_webhook(request: Request):
     if not BOT_TOKEN:
         return Response(status_code=200)
+
     try:
         data = await request.json()
     except Exception:
         return Response(status_code=200)
+
+    # جلوگیری از پردازش تکراری همان update_id (retry تلگرام)
+    update_id = data.get("update_id")
+    if update_id is not None:
+        if update_id in _processed_updates:
+            return Response(status_code=200)
+        _processed_updates.add(update_id)
+        if len(_processed_updates) > _processed_max:
+            # پاکسازی ساده
+            for _ in range(100):
+                try:
+                    _processed_updates.pop()
+                except KeyError:
+                    break
 
     message = data.get("message") or data.get("edited_message")
     if not message:
@@ -299,7 +337,7 @@ async def telegram_webhook(request: Request):
     chat_id = message["chat"]["id"]
     text = (message.get("text") or message.get("caption") or "").strip()
 
-    # آپلود مستقیم PDF به ربات
+    # آپلود PDF
     doc = message.get("document")
     if doc:
         file_name = (doc.get("file_name") or "").lower()
@@ -312,9 +350,9 @@ async def telegram_webhook(request: Request):
                 tickers = parsed.get("tickers") or []
                 if not tickers:
                     send_telegram_message(chat_id, "در این PDF تیکری پیدا نشد.")
-                    return Response(status_code=200)
-                scored = score_ticker_list(tickers)
-                send_telegram_message(chat_id, format_scan(scored))
+                else:
+                    scored = score_ticker_list(tickers)
+                    send_telegram_message(chat_id, format_scan(scored))
             except Exception as e:
                 logger.exception("pdf upload failed")
                 send_telegram_message(chat_id, f"خطا در خواندن PDF:\n{str(e)[:250]}")
@@ -343,14 +381,13 @@ async def telegram_webhook(request: Request):
         return Response(status_code=200)
 
     if text.startswith("/scan"):
+        if chat_id in _scan_locks:
+            send_telegram_message(chat_id, "یک اسکن در حال اجراست. لطفاً صبر کن.")
+            return Response(status_code=200)
+
         send_telegram_message(chat_id, "در حال اسکن کانال @bitfa (متن + PDF)... ⏳\nممکن است تا ۲ دقیقه طول بکشد.")
-        try:
-            from channel_scanner import scan_and_score
-            result = await scan_and_score(limit_messages=50)
-            send_telegram_message(chat_id, format_scan(result))
-        except Exception as e:
-            logger.exception("scan failed")
-            send_telegram_message(chat_id, f"خطا در /scan:\n{str(e)[:300]}")
+        # پردازش در پس‌زمینه — فوراً ۲۰۰ برمی‌گردانیم تا تلگرام retry نکند
+        asyncio.create_task(run_scan_job(chat_id))
         return Response(status_code=200)
 
     if text.startswith("/"):
@@ -412,7 +449,12 @@ def set_webhook():
     webhook_url = f"{WEBHOOK_BASE.rstrip('/')}/telegram-webhook"
     api = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook"
     try:
-        r = http_requests.post(api, json={"url": webhook_url}, timeout=10)
+        # drop_pending_updates کمک می‌کند صف قدیمی تکرار نشود
+        r = http_requests.post(
+            api,
+            json={"url": webhook_url, "drop_pending_updates": True},
+            timeout=10,
+        )
         logger.info(f"Webhook set: {r.status_code} {r.text[:200]}")
     except Exception as e:
         logger.error(f"Failed to set webhook: {e}")
