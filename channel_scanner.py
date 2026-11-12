@@ -1,5 +1,5 @@
 """
-خواندن پیام‌های اخیر کانال BITFA و استخراج تیکر
+خواندن پیام‌ها و PDFهای کانال BITFA + امتیازدهی
 """
 
 import os
@@ -7,8 +7,10 @@ import re
 from typing import List, Dict, Any
 from telethon import TelegramClient
 from telethon.sessions import StringSession
+from telethon.tl.types import MessageMediaDocument
 
 from scorer import analyze_token
+from pdf_parser import parse_watchlist_pdf, extract_tickers_from_text
 
 API_ID = int(os.getenv("TELEGRAM_API_ID") or os.getenv("API_ID") or "0")
 API_HASH = os.getenv("TELEGRAM_API_HASH") or os.getenv("API_HASH") or ""
@@ -25,24 +27,30 @@ STOPWORDS = {
 
 
 def extract_tickers(text: str) -> List[str]:
-    if not text:
-        return []
-    items = []
-    for m in re.finditer(r"#([A-Za-z][A-Za-z0-9]{1,14})", text):
-        t = m.group(1).upper()
-        if t not in STOPWORDS:
-            items.append(t)
-    # حذف تکراری
-    seen = set()
-    out = []
-    for t in items:
-        if t not in seen:
-            seen.add(t)
-            out.append(t)
-    return out
+    return extract_tickers_from_text(text or "")
 
 
-async def fetch_recent_tickers(limit_messages: int = 40) -> Dict[str, Any]:
+def _is_pdf_document(msg) -> bool:
+    try:
+        if not msg.media or not isinstance(msg.media, MessageMediaDocument):
+            return False
+        doc = msg.media.document
+        if not doc:
+            return False
+        # mime یا نام فایل
+        mime = getattr(doc, "mime_type", "") or ""
+        if "pdf" in mime.lower():
+            return True
+        for attr in (doc.attributes or []):
+            fn = getattr(attr, "file_name", "") or ""
+            if fn.lower().endswith(".pdf"):
+                return True
+        return False
+    except Exception:
+        return False
+
+
+async def fetch_recent_tickers(limit_messages: int = 50) -> Dict[str, Any]:
     if not SESSION or not API_ID or not API_HASH:
         return {"error": "TELEGRAM_SESSION / API_ID / API_HASH تنظیم نشده", "tickers": [], "messages_checked": 0}
 
@@ -52,22 +60,56 @@ async def fetch_recent_tickers(limit_messages: int = 40) -> Dict[str, Any]:
         await client.disconnect()
         return {"error": "Session نامعتبر است. دوباره بساز.", "tickers": [], "messages_checked": 0}
 
-    tickers = []
+    tickers: List[str] = []
+    sources: List[str] = []
     samples = []
+    pdfs_parsed = 0
+
     try:
         entity = await client.get_entity(CHANNEL)
         count = 0
         async for msg in client.iter_messages(entity, limit=limit_messages):
             count += 1
             text = msg.message or ""
+
+            # متن پیام
             found = extract_tickers(text)
-            if found:
-                for t in found:
-                    if t not in tickers:
-                        tickers.append(t)
-                if len(samples) < 5:
-                    samples.append({"id": msg.id, "date": str(msg.date), "tickers": found, "preview": text[:120].replace("\n", " ")})
-            if len(tickers) >= 20:
+            for t in found:
+                if t not in tickers:
+                    tickers.append(t)
+                    sources.append("text")
+
+            # PDF پیوست
+            if _is_pdf_document(msg):
+                try:
+                    data = await client.download_media(msg, file=bytes)
+                    if data:
+                        parsed = parse_watchlist_pdf(data)
+                        pdfs_parsed += 1
+                        for t in parsed.get("tickers") or []:
+                            if t not in tickers:
+                                tickers.append(t)
+                                sources.append("pdf")
+                        if len(samples) < 3:
+                            samples.append({
+                                "type": "pdf",
+                                "id": msg.id,
+                                "tickers": parsed.get("tickers", [])[:10],
+                                "chars": parsed.get("chars", 0),
+                            })
+                except Exception as e:
+                    print(f"PDF download/parse error: {e}")
+
+            if found and len(samples) < 5:
+                samples.append({
+                    "type": "text",
+                    "id": msg.id,
+                    "date": str(msg.date),
+                    "tickers": found,
+                    "preview": text[:120].replace("\n", " "),
+                })
+
+            if len(tickers) >= 25:
                 break
     except Exception as e:
         await client.disconnect()
@@ -75,14 +117,15 @@ async def fetch_recent_tickers(limit_messages: int = 40) -> Dict[str, Any]:
 
     await client.disconnect()
     return {
-        "tickers": tickers[:20],
+        "tickers": tickers[:25],
         "messages_checked": count,
+        "pdfs_parsed": pdfs_parsed,
         "samples": samples,
         "channel": CHANNEL,
     }
 
 
-async def scan_and_score(limit_messages: int = 40) -> Dict[str, Any]:
+async def scan_and_score(limit_messages: int = 50) -> Dict[str, Any]:
     meta = await fetch_recent_tickers(limit_messages=limit_messages)
     if meta.get("error"):
         return meta
@@ -91,7 +134,7 @@ async def scan_and_score(limit_messages: int = 40) -> Dict[str, Any]:
     results = []
     summary = {"HOT": [], "QUALIFIED": [], "WATCH": [], "SKIP": []}
 
-    for t in tickers[:12]:  # محدودیت برای سرعت و rate limit
+    for t in tickers[:12]:
         try:
             r = analyze_token(symbol=t)
             results.append({"ticker": t, "result": r})
@@ -105,6 +148,7 @@ async def scan_and_score(limit_messages: int = 40) -> Dict[str, Any]:
     return {
         "channel": meta.get("channel"),
         "messages_checked": meta.get("messages_checked"),
+        "pdfs_parsed": meta.get("pdfs_parsed", 0),
         "tickers_found": tickers,
         "summary": summary,
         "results": results,
