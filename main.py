@@ -1,12 +1,13 @@
 """
 BITFA Scorer + Telegram Bot
-نسخه ۱.۳ - جداسازی سهام/پرپ از کریپتو در خروجی اسکن
+نسخه ۱.۳.۱ - اسکن با Thread تا روی Render گیر نکند
 """
 
 import os
 import re
 import logging
 import asyncio
+import threading
 from fastapi import FastAPI, Request, Response
 from pydantic import BaseModel
 from typing import Optional, List, Set
@@ -22,7 +23,7 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_BASE = os.getenv("RENDER_EXTERNAL_URL") or "https://bitfa-signal-bot.onrender.com"
 
-app = FastAPI(title="BITFA Signal Scorer", version="1.3.0")
+app = FastAPI(title="BITFA Signal Scorer", version="1.3.1")
 
 _scan_locks: Set[int] = set()
 _processed_updates: Set[int] = set()
@@ -192,6 +193,9 @@ def format_scan(data: dict) -> str:
     if data.get("error"):
         return f"❌ خطا در اسکن کانال:\n{data.get('error')}"
 
+    if data.get("note") and not (data.get("results") or []):
+        return f"📡 اسکن انجام شد.\n{data.get('note')}\nپیام: {data.get('messages_checked', 0)} | PDF: {data.get('pdfs_parsed', 0)}"
+
     lines = [
         "📡 *اسکن کانال BITFA*",
         f"پیام: {data.get('messages_checked', 0)} | PDF: {data.get('pdfs_parsed', 0)} | تیکر: {len(data.get('tickers_found') or [])}",
@@ -294,15 +298,23 @@ def download_telegram_file(file_id: str) -> bytes:
     return fr.content
 
 
-async def run_scan_job(chat_id: int):
+def run_scan_job_thread(chat_id: int):
+    """اجرا در Thread جدا — روی Render پایدارتر از create_task"""
     if chat_id in _scan_locks:
         send_telegram_message(chat_id, "یک اسکن در حال اجراست. لطفاً صبر کن.")
         return
     _scan_locks.add(chat_id)
     try:
         from channel_scanner import scan_and_score
-        result = await scan_and_score(limit_messages=40)
+
+        async def _run():
+            return await asyncio.wait_for(scan_and_score(limit_messages=30), timeout=150)
+
+        result = asyncio.run(_run())
         send_telegram_message(chat_id, format_scan(result))
+    except asyncio.TimeoutError:
+        logger.error("scan timeout")
+        send_telegram_message(chat_id, "⏱ اسکن بیش از ۲.۵ دقیقه طول کشید و متوقف شد.\nلطفاً دوباره /scan بزن یا PDF را مستقیم بفرست.")
     except Exception as e:
         logger.exception("scan failed")
         send_telegram_message(chat_id, f"خطا در /scan:\n{str(e)[:300]}")
@@ -314,15 +326,15 @@ async def run_scan_job(chat_id: int):
 def root():
     return {
         "status": "ok",
-        "version": "1.3.0",
-        "message": "BITFA Scorer - stock/perp separated",
+        "version": "1.3.1",
+        "message": "BITFA Scorer - reliable scan thread",
         "bot": "enabled" if BOT_TOKEN else "disabled"
     }
 
 
 @app.get("/health")
 def health():
-    return {"status": "healthy", "version": "1.3.0"}
+    return {"status": "healthy", "version": "1.3.1"}
 
 
 @app.post("/analyze")
@@ -390,7 +402,7 @@ async def telegram_webhook(request: Request):
             "سلام 👋\nربات امتیازدهی سبک BITFA\n\n"
             "• تیکر / آدرس / متن واچ‌لیست بفرست\n"
             "• PDF واچ‌لیست را مستقیم بفرست\n"
-            "• /scan اسکن تمیز کانال (PDF اول + جداسازی سهام/پرپ)"
+            "• /scan اسکن کانال (حداکثر حدود ۲ دقیقه)"
         )
         return Response(status_code=200)
 
@@ -398,7 +410,7 @@ async def telegram_webhook(request: Request):
         send_telegram_message(
             chat_id,
             "دستورات:\n"
-            "/scan — اسکن تمیز کانال BITFA\n"
+            "/scan — اسکن کانال BITFA\n"
             "یا تیکر/آدرس/متن/فایل PDF بفرست."
         )
         return Response(status_code=200)
@@ -408,8 +420,14 @@ async def telegram_webhook(request: Request):
             send_telegram_message(chat_id, "یک اسکن در حال اجراست. لطفاً صبر کن.")
             return Response(status_code=200)
 
-        send_telegram_message(chat_id, "در حال اسکن تمیز کانال @bitfa ... ⏳")
-        asyncio.create_task(run_scan_job(chat_id))
+        send_telegram_message(
+            chat_id,
+            "در حال اسکن کانال @bitfa ... ⏳\n"
+            "اگر تا ۳ دقیقه جواب نیامد دوباره /scan بزن.\n"
+            "راه مطمئن‌تر: PDF واچ‌لیست را مستقیم بفرست."
+        )
+        t = threading.Thread(target=run_scan_job_thread, args=(chat_id,), daemon=True)
+        t.start()
         return Response(status_code=200)
 
     if text.startswith("/"):

@@ -1,10 +1,10 @@
 """
-خواندن کانال BITFA - نسخه تمیز:
-اولویت PDF واچ‌لیست، فیلتر نویز، مرتب‌سازی بر اساس امتیاز
+خواندن کانال BITFA - با timeout برای جلوگیری از گیر کردن
 """
 
 import os
 import re
+import asyncio
 from typing import List, Dict, Any, Tuple
 from telethon import TelegramClient
 from telethon.sessions import StringSession
@@ -48,20 +48,43 @@ def _looks_like_watchlist_text(text: str) -> bool:
         return False
     if WATCHLIST_HINTS.search(text):
         return True
-    # چند هشتگ در یک پیام
     tags = re.findall(r"#[A-Za-z][A-Za-z0-9]{1,14}", text)
     return len(tags) >= 2
 
 
-async def fetch_recent_tickers(limit_messages: int = 40) -> Dict[str, Any]:
+async def fetch_recent_tickers(limit_messages: int = 30) -> Dict[str, Any]:
     if not SESSION or not API_ID or not API_HASH:
         return {"error": "TELEGRAM_SESSION / API_ID / API_HASH تنظیم نشده", "tickers": [], "messages_checked": 0}
 
-    client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
-    await client.connect()
-    if not await client.is_user_authorized():
-        await client.disconnect()
-        return {"error": "Session نامعتبر است. دوباره بساز.", "tickers": [], "messages_checked": 0}
+    client = TelegramClient(
+        StringSession(SESSION),
+        API_ID,
+        API_HASH,
+        connection_retries=3,
+        request_retries=3,
+        retry_delay=1,
+        timeout=20,
+    )
+
+    try:
+        await asyncio.wait_for(client.connect(), timeout=30)
+    except Exception as e:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        return {"error": f"اتصال تلگرام ناموفق: {e}", "tickers": [], "messages_checked": 0}
+
+    try:
+        if not await asyncio.wait_for(client.is_user_authorized(), timeout=15):
+            await client.disconnect()
+            return {"error": "Session نامعتبر است. دوباره بساز.", "tickers": [], "messages_checked": 0}
+    except Exception as e:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        return {"error": f"بررسی Session ناموفق: {e}", "tickers": [], "messages_checked": 0}
 
     pdf_tickers: List[str] = []
     text_tickers: List[str] = []
@@ -70,15 +93,14 @@ async def fetch_recent_tickers(limit_messages: int = 40) -> Dict[str, Any]:
     count = 0
 
     try:
-        entity = await client.get_entity(CHANNEL)
+        entity = await asyncio.wait_for(client.get_entity(CHANNEL), timeout=25)
         async for msg in client.iter_messages(entity, limit=limit_messages):
             count += 1
             text = msg.message or ""
 
-            # ۱) PDFها اول و مهم‌تر
-            if _is_pdf_document(msg):
+            if _is_pdf_document(msg) and pdfs_parsed < 3:
                 try:
-                    data = await client.download_media(msg, file=bytes)
+                    data = await asyncio.wait_for(client.download_media(msg, file=bytes), timeout=45)
                     if data:
                         parsed = parse_watchlist_pdf(data)
                         pdfs_parsed += 1
@@ -95,7 +117,6 @@ async def fetch_recent_tickers(limit_messages: int = 40) -> Dict[str, Any]:
                 except Exception as e:
                     print(f"PDF download/parse error: {e}")
 
-            # ۲) فقط متن‌هایی که شبیه واچ‌لیست‌اند
             elif _looks_like_watchlist_text(text):
                 found = extract_tickers_from_text(text, strict=True)
                 for t in found:
@@ -110,24 +131,28 @@ async def fetch_recent_tickers(limit_messages: int = 40) -> Dict[str, Any]:
                         "preview": text[:100].replace("\n", " "),
                     })
 
-            # اگر از PDF به اندازه کافی تیکر داریم، کافی است
-            if len(pdf_tickers) >= 15:
+            if len(pdf_tickers) >= 12:
                 break
 
     except Exception as e:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        return {"error": f"خطا در خواندن کانال: {e}", "tickers": [], "messages_checked": count}
+
+    try:
         await client.disconnect()
-        return {"error": f"خطا در خواندن کانال: {e}", "tickers": [], "messages_checked": 0}
+    except Exception:
+        pass
 
-    await client.disconnect()
-
-    # اولویت: PDF سپس متن واچ‌لیست
     merged: List[str] = []
     for t in pdf_tickers + text_tickers:
         if t not in merged:
             merged.append(t)
 
     return {
-        "tickers": merged[:20],
+        "tickers": merged[:18],
         "pdf_tickers": pdf_tickers,
         "text_tickers": text_tickers,
         "messages_checked": count,
@@ -137,15 +162,28 @@ async def fetch_recent_tickers(limit_messages: int = 40) -> Dict[str, Any]:
     }
 
 
-async def scan_and_score(limit_messages: int = 40) -> Dict[str, Any]:
+async def scan_and_score(limit_messages: int = 30) -> Dict[str, Any]:
     meta = await fetch_recent_tickers(limit_messages=limit_messages)
     if meta.get("error"):
         return meta
 
     tickers = meta.get("tickers") or []
+    if not tickers:
+        return {
+            "channel": meta.get("channel"),
+            "messages_checked": meta.get("messages_checked"),
+            "pdfs_parsed": meta.get("pdfs_parsed", 0),
+            "tickers_found": [],
+            "summary": {"HOT": [], "QUALIFIED": [], "WATCH": [], "SKIP": []},
+            "results": [],
+            "error": None,
+            "note": "تیکری پیدا نشد",
+        }
+
     scored_rows: List[Tuple[int, str, dict]] = []
 
-    for t in tickers[:15]:
+    # حداکثر ۱۰ تا برای سرعت و جلوگیری از timeout
+    for t in tickers[:10]:
         try:
             r = analyze_token(symbol=t)
             score = int(r.get("score") or 0)
@@ -153,7 +191,6 @@ async def scan_and_score(limit_messages: int = 40) -> Dict[str, Any]:
         except Exception as e:
             scored_rows.append((0, t, {"error": str(e)[:100], "score": 0, "category": "SKIP", "token": t}))
 
-    # مرتب‌سازی از امتیاز بالا به پایین
     scored_rows.sort(key=lambda x: x[0], reverse=True)
 
     summary = {"HOT": [], "QUALIFIED": [], "WATCH": [], "SKIP": []}
@@ -166,10 +203,8 @@ async def scan_and_score(limit_messages: int = 40) -> Dict[str, Any]:
         summary[cat].append(label)
         results.append({"ticker": t, "result": r})
 
-    # برای خروجی تمیز: اول غیر-SKIPها، بعد حداکثر چند SKIP
     focus = [x for x in results if (x["result"].get("category") in ("HOT", "QUALIFIED", "WATCH"))]
     skips = [x for x in results if x["result"].get("category") == "SKIP"][:4]
-    display = focus + skips
 
     return {
         "channel": meta.get("channel"),
@@ -179,6 +214,6 @@ async def scan_and_score(limit_messages: int = 40) -> Dict[str, Any]:
         "pdf_tickers": meta.get("pdf_tickers", []),
         "text_tickers": meta.get("text_tickers", []),
         "summary": summary,
-        "results": display,
+        "results": focus + skips,
         "samples": meta.get("samples", []),
     }
