@@ -1,0 +1,25 @@
+name: Daily BITFA Scan
+
+on:
+  schedule:
+    # هر روز ساعت 05:30 UTC ≈ 09:00 تهران
+    - cron: "30 5 * * *"
+  workflow_dispatch: # اجرای دستی از تب Actions
+
+jobs:
+  trigger-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call Render daily-scan endpoint
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          ADMIN_CHAT_ID: ${{ secrets.ADMIN_CHAT_ID }}
+        run: |
+          if [ -z "$CRON_SECRET" ] || [ -z "$ADMIN_CHAT_ID" ]; then
+            echo "CRON_SECRET یا ADMIN_CHAT_ID در GitHub Secrets ست نشده"
+            exit 1
+          fi
+          URL="https://bitfa-signal-bot.onrender.com/cron/daily-scan?key=${CRON_SECRET}&chat_id=${ADMIN_CHAT_ID}"
+          echo "Calling daily scan..."
+          curl -sS -f --max-time 30 "$URL" || curl -sS --max-time 30 "$URL"
+          echo "Done."
