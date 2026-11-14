@@ -1,5 +1,5 @@
 """
-خواندن کانال BITFA - با timeout برای جلوگیری از گیر کردن
+خواندن کانال BITFA - با timeout + یادداشت تحلیلگر از PDF
 """
 
 import os
@@ -88,6 +88,7 @@ async def fetch_recent_tickers(limit_messages: int = 30) -> Dict[str, Any]:
 
     pdf_tickers: List[str] = []
     text_tickers: List[str] = []
+    notes_map: Dict[str, Dict[str, Any]] = {}
     samples = []
     pdfs_parsed = 0
     count = 0
@@ -107,12 +108,17 @@ async def fetch_recent_tickers(limit_messages: int = 30) -> Dict[str, Any]:
                         for t in parsed.get("tickers") or []:
                             if t not in pdf_tickers:
                                 pdf_tickers.append(t)
+                        # ادغام notes
+                        for k, v in (parsed.get("notes_map") or {}).items():
+                            if k not in notes_map or (v.get("analyst_note") and not notes_map[k].get("analyst_note")):
+                                notes_map[k] = v
                         if len(samples) < 4:
                             samples.append({
                                 "type": "pdf",
                                 "id": msg.id,
                                 "tickers": (parsed.get("tickers") or [])[:12],
                                 "chars": parsed.get("chars", 0),
+                                "notes_count": len(parsed.get("notes_map") or {}),
                             })
                 except Exception as e:
                     print(f"PDF download/parse error: {e}")
@@ -155,11 +161,54 @@ async def fetch_recent_tickers(limit_messages: int = 30) -> Dict[str, Any]:
         "tickers": merged[:18],
         "pdf_tickers": pdf_tickers,
         "text_tickers": text_tickers,
+        "notes_map": notes_map,
         "messages_checked": count,
         "pdfs_parsed": pdfs_parsed,
         "samples": samples,
         "channel": CHANNEL,
     }
+
+
+def _apply_note_to_result(r: dict, note_info: dict) -> dict:
+    if not note_info:
+        return r
+    r = dict(r)
+    note = note_info.get("analyst_note") or ""
+    about = note_info.get("about") or ""
+    risk_label = note_info.get("risk_label")
+    boost = int(note_info.get("note_boost") or 0)
+
+    if note:
+        r["analyst_note"] = note
+    if about:
+        r["about_project"] = about
+    if risk_label:
+        r["bitfa_risk_label"] = risk_label
+
+    if boost and not r.get("error"):
+        old = int(r.get("score") or 0)
+        new_score = max(0, min(100, old + boost))
+        r["score"] = new_score
+        r["note_boost"] = boost
+        reasons = list(r.get("reasons") or [])
+        if boost > 0:
+            reasons.insert(0, f"یادداشت تحلیلگر BITFA: مثبت (+{boost})")
+        elif boost < 0:
+            reasons.insert(0, f"یادداشت تحلیلگر BITFA: محتاطانه ({boost})")
+        r["reasons"] = reasons
+
+        # دسته را با امتیاز جدید هماهنگ کن
+        conf = int(r.get("confidence") or 0)
+        if new_score >= 80 and conf >= 70:
+            r["category"], r["recommendation"], r["action"] = "HOT", "امتیاز عالی - قابل بررسی جدی برای ورود محدود", "اولویت بررسی"
+        elif new_score >= 65:
+            r["category"], r["recommendation"], r["action"] = "QUALIFIED", "امتیاز خوب - مناسب بررسی با مدیریت ریسک سخت", "بررسی برای ورود"
+        elif new_score >= 48:
+            r["category"], r["recommendation"], r["action"] = "WATCH", "امتیاز متوسط - فقط نظارت و انتظار تأیید ساختار", "نظارت"
+        else:
+            r["category"], r["recommendation"], r["action"] = "SKIP", "امتیاز ضعیف - رد شود", "رد"
+
+    return r
 
 
 async def scan_and_score(limit_messages: int = 30) -> Dict[str, Any]:
@@ -168,6 +217,7 @@ async def scan_and_score(limit_messages: int = 30) -> Dict[str, Any]:
         return meta
 
     tickers = meta.get("tickers") or []
+    notes_map = meta.get("notes_map") or {}
     if not tickers:
         return {
             "channel": meta.get("channel"),
@@ -182,10 +232,10 @@ async def scan_and_score(limit_messages: int = 30) -> Dict[str, Any]:
 
     scored_rows: List[Tuple[int, str, dict]] = []
 
-    # حداکثر ۱۰ تا برای سرعت و جلوگیری از timeout
     for t in tickers[:10]:
         try:
             r = analyze_token(symbol=t)
+            r = _apply_note_to_result(r, notes_map.get(t.upper()) or notes_map.get(t))
             score = int(r.get("score") or 0)
             scored_rows.append((score, t, r))
         except Exception as e:
@@ -213,6 +263,7 @@ async def scan_and_score(limit_messages: int = 30) -> Dict[str, Any]:
         "tickers_found": tickers,
         "pdf_tickers": meta.get("pdf_tickers", []),
         "text_tickers": meta.get("text_tickers", []),
+        "notes_map": notes_map,
         "summary": summary,
         "results": focus + skips,
         "samples": meta.get("samples", []),
