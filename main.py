@@ -1,6 +1,6 @@
 """
 BITFA Scorer + Telegram Bot
-نسخه ۱.۵.۰ - یادداشت تحلیلگر PDF + PA + اسکن پایدار
+نسخه ۱.۶.۰ - اسکن روزانه + حافظه واچ‌لیست + یادداشت تحلیلگر
 """
 
 import os
@@ -8,7 +8,7 @@ import re
 import logging
 import asyncio
 import threading
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request, Response, Query
 from pydantic import BaseModel
 from typing import Optional, List, Set, Dict, Any
 import uvicorn
@@ -22,8 +22,10 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_BASE = os.getenv("RENDER_EXTERNAL_URL") or "https://bitfa-signal-bot.onrender.com"
+CRON_SECRET = os.getenv("CRON_SECRET") or ""
+ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID") or ""
 
-app = FastAPI(title="BITFA Signal Scorer", version="1.5.0")
+app = FastAPI(title="BITFA Signal Scorer", version="1.6.0")
 
 _scan_locks: Set[int] = set()
 _processed_updates: Set[int] = set()
@@ -134,7 +136,7 @@ def _apply_note_boost(r: dict, note_info: Optional[dict]) -> dict:
     return r
 
 
-def format_single(name: str, result: dict) -> str:
+def format_single(name: str, result: dict, badge: str = "") -> str:
     if result.get("error"):
         return f"*{name}* → خطا: {result.get('error')}"
     token = result.get("token") or name
@@ -149,9 +151,10 @@ def format_single(name: str, result: dict) -> str:
     rank_txt = f" | رتبه #{rank}" if rank else ""
     kind_txt = " | 🏛 سهام/پرپ" if str(kind).startswith("stock") else ""
     pa_txt = _pa_line(result)
-    note_flag = " | 📝یادداشت" if result.get("analyst_note") else ""
+    note_flag = " | 📝" if result.get("analyst_note") else ""
+    badge_txt = f" {badge}" if badge else ""
     return (
-        f"{cat_emoji} *#{token}* | {price_str}{rank_txt}{kind_txt}{pa_txt}{note_flag}\n"
+        f"{cat_emoji} *#{token}*{badge_txt} | {price_str}{rank_txt}{kind_txt}{pa_txt}{note_flag}\n"
         f"{score}/100 | {category} | {action} | ریسک: {risk}"
     )
 
@@ -214,10 +217,7 @@ def format_full(result: dict) -> str:
         tag_str = ", ".join(pa_tags) if pa_tags else "-"
         lines.append(f"📐 *Price Action:* {pa_score}/20 | {tag_str}")
 
-    lines += [
-        "",
-        f"📝 *توصیه:*\n{rec}",
-    ]
+    lines += ["", f"📝 *توصیه:*\n{rec}"]
 
     if analyst_note:
         lines.append("\n📌 *یادداشت تحلیلگر BITFA:*")
@@ -274,6 +274,17 @@ def format_scan(data: dict) -> str:
         "",
     ]
 
+    diff = data.get("diff") or {}
+    if diff.get("new") or diff.get("improved") or diff.get("dropped"):
+        lines.append("🧠 *تغییر نسبت به اسکن قبل:*")
+        if diff.get("new"):
+            lines.append("🆕 جدید: " + ", ".join(f"#{x}" for x in diff["new"][:8]))
+        if diff.get("improved"):
+            lines.append("📈 بهبود امتیاز: " + ", ".join(f"#{x}" for x in diff["improved"][:8]))
+        if diff.get("dropped"):
+            lines.append("📉 خارج‌شده از لیست خوب: " + ", ".join(f"#{x}" for x in diff["dropped"][:6]))
+        lines.append("")
+
     summary = data.get("summary") or {}
     if summary.get("HOT"):
         lines.append("🔥 *HOT:* " + ", ".join(summary["HOT"]))
@@ -289,6 +300,9 @@ def format_scan(data: dict) -> str:
             skip_line += f" …(+{extra})"
         lines.append("❌ *SKIP:* " + skip_line)
 
+    new_set = set(diff.get("new") or [])
+    improved_set = set(diff.get("improved") or [])
+
     crypto_rows = []
     stock_rows = []
     for item in (data.get("results") or []):
@@ -301,7 +315,13 @@ def format_scan(data: dict) -> str:
     if crypto_rows:
         lines.append("\n────────────\n*کریپتو (مرتب‌شده):*\n")
         for item in crypto_rows:
-            lines.append(format_single(item.get("ticker"), item.get("result") or {}))
+            t = (item.get("result") or {}).get("token") or item.get("ticker") or ""
+            badge = ""
+            if t.upper() in new_set:
+                badge = "🆕"
+            elif t.upper() in improved_set:
+                badge = "📈"
+            lines.append(format_single(item.get("ticker"), item.get("result") or {}, badge=badge))
             note = (item.get("result") or {}).get("analyst_note")
             if note:
                 short = note[:160] + ("…" if len(note) > 160 else "")
@@ -315,6 +335,55 @@ def format_scan(data: dict) -> str:
             lines.append("")
 
     lines.append("_اولویت با PDF واچ‌لیست_\n_دستور: /scan_\n_NFA | DYOR_")
+    return "\n".join(lines)
+
+
+def format_daily_report(data: dict) -> str:
+    """فقط HOT/QUALIFIED + تیکرهای جدید/بهبودیافته — برای پیام خودکار روزانه."""
+    if data.get("error"):
+        return f"❌ اسکن روزانه ناموفق:\n{data.get('error')}"
+
+    lines = ["☀️ *گزارش روزانه BITFA*", ""]
+    diff = data.get("diff") or {}
+    summary = data.get("summary") or {}
+
+    hot = summary.get("HOT") or []
+    qual = summary.get("QUALIFIED") or []
+
+    if not hot and not qual:
+        lines.append("امروز مورد HOT/QUALIFIED پیدا نشد.")
+        if diff.get("dropped"):
+            lines.append("📉 خارج‌شده: " + ", ".join(f"#{x}" for x in diff["dropped"][:6]))
+        lines.append("\n_NFA | DYOR_")
+        return "\n".join(lines)
+
+    if diff.get("new"):
+        lines.append("🆕 *جدید در لیست:* " + ", ".join(f"#{x}" for x in diff["new"][:8]))
+    if diff.get("improved"):
+        lines.append("📈 *بهبود امتیاز:* " + ", ".join(f"#{x}" for x in diff["improved"][:8]))
+    if hot:
+        lines.append("🔥 *HOT:* " + ", ".join(hot))
+    if qual:
+        lines.append("✅ *QUALIFIED:* " + ", ".join(qual))
+    lines.append("")
+
+    new_set = set(diff.get("new") or [])
+    improved_set = set(diff.get("improved") or [])
+
+    for item in (data.get("results") or []):
+        r = item.get("result") or {}
+        cat = r.get("category")
+        if cat not in ("HOT", "QUALIFIED"):
+            continue
+        t = (r.get("token") or item.get("ticker") or "").upper()
+        badge = "🆕" if t in new_set else ("📈" if t in improved_set else "")
+        lines.append(format_single(item.get("ticker"), r, badge=badge))
+        note = r.get("analyst_note")
+        if note:
+            lines.append(f"📝 {note[:180]}{'…' if len(note) > 180 else ''}")
+        lines.append("")
+
+    lines.append("_گزارش خودکار روزانه_\n_NFA | DYOR_")
     return "\n".join(lines)
 
 
@@ -345,6 +414,7 @@ def score_ticker_list(tickers: List[str], notes_map: Optional[Dict[str, Any]] = 
         "tickers_found": tickers,
         "summary": summary,
         "results": focus + skips,
+        "diff": {"new": [], "improved": [], "dropped": [], "unchanged_hot": []},
     }
 
 
@@ -376,7 +446,7 @@ def download_telegram_file(file_id: str) -> bytes:
     return fr.content
 
 
-def run_scan_job_thread(chat_id: int):
+def run_scan_job_thread(chat_id: int, daily: bool = False):
     if chat_id in _scan_locks:
         send_telegram_message(chat_id, "یک اسکن در حال اجراست. لطفاً صبر کن.")
         return
@@ -385,10 +455,11 @@ def run_scan_job_thread(chat_id: int):
         from channel_scanner import scan_and_score
 
         async def _run():
-            return await asyncio.wait_for(scan_and_score(limit_messages=30), timeout=150)
+            return await asyncio.wait_for(scan_and_score(limit_messages=30, persist=True), timeout=150)
 
         result = asyncio.run(_run())
-        send_telegram_message(chat_id, format_scan(result))
+        text = format_daily_report(result) if daily else format_scan(result)
+        send_telegram_message(chat_id, text)
     except asyncio.TimeoutError:
         logger.error("scan timeout")
         send_telegram_message(chat_id, "⏱ اسکن بیش از ۲.۵ دقیقه طول کشید و متوقف شد.\nلطفاً دوباره /scan بزن یا PDF را مستقیم بفرست.")
@@ -403,15 +474,39 @@ def run_scan_job_thread(chat_id: int):
 def root():
     return {
         "status": "ok",
-        "version": "1.5.0",
-        "message": "BITFA Scorer - analyst notes from PDF",
-        "bot": "enabled" if BOT_TOKEN else "disabled"
+        "version": "1.6.0",
+        "message": "BITFA Scorer - daily scan + memory",
+        "bot": "enabled" if BOT_TOKEN else "disabled",
+        "cron": "/cron/daily-scan?key=CRON_SECRET&chat_id=YOUR_CHAT_ID",
     }
 
 
 @app.get("/health")
 def health():
-    return {"status": "healthy", "version": "1.5.0"}
+    return {"status": "healthy", "version": "1.6.0"}
+
+
+@app.get("/cron/daily-scan")
+def cron_daily_scan(key: str = Query(""), chat_id: Optional[str] = Query(None)):
+    """
+    برای کرون خارجی (مثلاً cron-job.org):
+    GET /cron/daily-scan?key=CRON_SECRET&chat_id=123456
+    """
+    if not CRON_SECRET or key != CRON_SECRET:
+        return Response(content='{"error":"unauthorized"}', status_code=401, media_type="application/json")
+
+    target = chat_id or ADMIN_CHAT_ID
+    if not target:
+        return {"error": "chat_id یا ADMIN_CHAT_ID لازم است"}
+
+    try:
+        cid = int(target)
+    except Exception:
+        return {"error": "chat_id نامعتبر"}
+
+    t = threading.Thread(target=run_scan_job_thread, args=(cid, True), daemon=True)
+    t.start()
+    return {"ok": True, "message": "daily scan started", "chat_id": cid}
 
 
 @app.post("/analyze")
@@ -466,7 +561,6 @@ async def telegram_webhook(request: Request):
                 else:
                     scored = score_ticker_list(tickers, notes_map=notes_map)
                     send_telegram_message(chat_id, format_scan(scored))
-                    # برای اولین نتیجه با یادداشت، جزئیات کامل بفرست
                     for item in (scored.get("results") or [])[:2]:
                         r = item.get("result") or {}
                         if r.get("analyst_note"):
@@ -483,19 +577,17 @@ async def telegram_webhook(request: Request):
     if text.startswith("/start"):
         send_telegram_message(
             chat_id,
-            "سلام 👋\nربات امتیازدهی BITFA + Price Action + یادداشت تحلیلگر\n\n"
-            "• تیکر / آدرس / متن واچ‌لیست بفرست\n"
-            "• PDF واچ‌لیست را مستقیم بفرست (یادداشت تحلیلگر هم خوانده می‌شود)\n"
-            "• /scan اسکن کانال"
+            "سلام 👋\nربات BITFA + PA + یادداشت تحلیلگر + حافظه اسکن\n\n"
+            "• تیکر / آدرس / PDF بفرست\n"
+            "• /scan اسکن کانال\n"
+            "• گزارش روزانه با کرون خارجی قابل تنظیم است"
         )
         return Response(status_code=200)
 
     if text.startswith("/help"):
         send_telegram_message(
             chat_id,
-            "دستورات:\n"
-            "/scan — اسکن کانال BITFA\n"
-            "یا تیکر/آدرس/متن/فایل PDF بفرست."
+            "دستورات:\n/scan — اسکن کانال\nتیکر/آدرس/PDF را مستقیم بفرست."
         )
         return Response(status_code=200)
 
@@ -510,7 +602,7 @@ async def telegram_webhook(request: Request):
             "اگر تا ۳ دقیقه جواب نیامد دوباره /scan بزن.\n"
             "راه مطمئن‌تر: PDF واچ‌لیست را مستقیم بفرست."
         )
-        t = threading.Thread(target=run_scan_job_thread, args=(chat_id,), daemon=True)
+        t = threading.Thread(target=run_scan_job_thread, args=(chat_id, False), daemon=True)
         t.start()
         return Response(status_code=200)
 
