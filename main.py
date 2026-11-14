@@ -1,6 +1,6 @@
 """
 BITFA Scorer + Telegram Bot
-نسخه ۱.۳.۱ - اسکن با Thread تا روی Render گیر نکند
+نسخه ۱.۴.۰ - لایه Price Action + اسکن پایدار
 """
 
 import os
@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_BASE = os.getenv("RENDER_EXTERNAL_URL") or "https://bitfa-signal-bot.onrender.com"
 
-app = FastAPI(title="BITFA Signal Scorer", version="1.3.1")
+app = FastAPI(title="BITFA Signal Scorer", version="1.4.0")
 
 _scan_locks: Set[int] = set()
 _processed_updates: Set[int] = set()
@@ -86,6 +86,15 @@ def extract_tickers_and_addresses(text: str) -> List[str]:
     return unique[:12]
 
 
+def _pa_line(result: dict) -> str:
+    pa = result.get("pa_score")
+    tags = result.get("pa_tags") or []
+    if pa is None:
+        return ""
+    tag_txt = ", ".join(tags[:3]) if tags else "-"
+    return f" | PA:{pa}/20 ({tag_txt})"
+
+
 def format_single(name: str, result: dict) -> str:
     if result.get("error"):
         return f"*{name}* → خطا: {result.get('error')}"
@@ -100,8 +109,9 @@ def format_single(name: str, result: dict) -> str:
     cat_emoji = {"HOT": "🔥", "QUALIFIED": "✅", "WATCH": "👀", "SKIP": "❌"}.get(category, "▪️")
     rank_txt = f" | رتبه #{rank}" if rank else ""
     kind_txt = " | 🏛 سهام/پرپ" if str(kind).startswith("stock") else ""
+    pa_txt = _pa_line(result)
     return (
-        f"{cat_emoji} *#{token}* | {price_str}{rank_txt}{kind_txt}\n"
+        f"{cat_emoji} *#{token}* | {price_str}{rank_txt}{kind_txt}{pa_txt}\n"
         f"{score}/100 | {category} | {action} | ریسک: {risk}"
     )
 
@@ -126,6 +136,8 @@ def format_full(result: dict) -> str:
     metrics = result.get("metrics", {})
     links = result.get("links") or {}
     kind = result.get("asset_kind") or "crypto"
+    pa_score = result.get("pa_score")
+    pa_tags = result.get("pa_tags") or []
 
     cat_emoji = {"HOT": "🔥", "QUALIFIED": "✅", "WATCH": "👀", "SKIP": "❌"}.get(category, "▪️")
     title = f"#{token}"
@@ -151,13 +163,20 @@ def format_full(result: dict) -> str:
         f"⚠️ *ریسک:* {risk}",
         f"🎯 *اعتماد:* {conf}%",
         f"💰 *پیشنهاد حجم:* {pos}",
+    ]
+
+    if pa_score is not None:
+        tag_str = ", ".join(pa_tags) if pa_tags else "-"
+        lines.append(f"📐 *Price Action:* {pa_score}/20 | {tag_str}")
+
+    lines += [
         "",
         f"📝 *توصیه:*\n{rec}",
     ]
 
     if reasons:
         lines.append("\n✅ *نکات:*")
-        for r in reasons[:6]:
+        for r in reasons[:7]:
             lines.append(f"• {r}")
 
     if warnings:
@@ -326,15 +345,15 @@ def run_scan_job_thread(chat_id: int):
 def root():
     return {
         "status": "ok",
-        "version": "1.3.1",
-        "message": "BITFA Scorer - reliable scan thread",
+        "version": "1.4.0",
+        "message": "BITFA Scorer - Price Action layer",
         "bot": "enabled" if BOT_TOKEN else "disabled"
     }
 
 
 @app.get("/health")
 def health():
-    return {"status": "healthy", "version": "1.3.1"}
+    return {"status": "healthy", "version": "1.4.0"}
 
 
 @app.post("/analyze")
@@ -399,7 +418,7 @@ async def telegram_webhook(request: Request):
     if text.startswith("/start"):
         send_telegram_message(
             chat_id,
-            "سلام 👋\nربات امتیازدهی سبک BITFA\n\n"
+            "سلام 👋\nربات امتیازدهی سبک BITFA + Price Action\n\n"
             "• تیکر / آدرس / متن واچ‌لیست بفرست\n"
             "• PDF واچ‌لیست را مستقیم بفرست\n"
             "• /scan اسکن کانال (حداکثر حدود ۲ دقیقه)"
