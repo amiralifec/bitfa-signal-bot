@@ -1,6 +1,6 @@
 """
-BITFA Signal Scorer - Version 0.9.1
-تگ سهام/پرپ برای جداسازی از توکن‌های کریپتو
+BITFA Signal Scorer - Version 1.0.0
+تگ سهام/پرپ + لایه Price Action سبک (الهام از stolgo / Al Brooks style)
 """
 
 import os
@@ -23,7 +23,7 @@ def safe_float(value, default=0.0):
         if value is None:
             return default
         return float(value)
-    except:
+    except Exception:
         return default
 
 
@@ -100,7 +100,7 @@ def pair_age_hours(pair: Dict) -> Optional[float]:
         created_dt = datetime.fromtimestamp(created, tz=timezone.utc)
         now = datetime.now(timezone.utc)
         return (now - created_dt).total_seconds() / 3600
-    except:
+    except Exception:
         return None
 
 
@@ -149,14 +149,105 @@ def detect_asset_kind(symbol: str, name: str, price_usd: Optional[float]) -> str
         return "stock_perp"
     if any(k in name_l for k in ["inc.", "corp", "semiconductor", "etf", "shares", "nasdaq", "equity"]):
         return "stock_perp"
-    # قیمت خیلی بالا برای آلت معمولی مشکوک به سهام/پرپ است
     if price_usd is not None and price_usd >= 50 and sym in STOCK_LIKE:
         return "stock_perp"
     if price_usd is not None and price_usd >= 100 and len(sym) <= 5:
-        # احتیاط: ممکن است BTC/ETH باشد که جدا فیلتر شده
         if sym not in {"BTC", "ETH", "BNB", "SOL"}:
             return "stock_perp_candidate"
     return "crypto"
+
+
+def calculate_price_action_score(
+    *,
+    price_change_24h: Optional[float],
+    price_change_1h: Optional[float],
+    volume_24h: float,
+    liquidity: float,
+    buys: float,
+    sells: float,
+) -> Tuple[int, List[str], List[str], List[str]]:
+    """
+    لایه سبک Price Action (الهام از مفاهیم stolgo / Al Brooks):
+    - مومنتوم + تأیید حجم
+    - غلبه خرید/فروش
+    - تشخیص فشار یا شکست ساختار ساده
+    امتیاز ۰ تا ۲۰ که به امتیاز اصلی اضافه می‌شود.
+    """
+    pa = 0
+    tags: List[str] = []
+    reasons: List[str] = []
+    warnings: List[str] = []
+
+    ch24 = price_change_24h
+    ch1 = price_change_1h
+
+    # نسبت حجم به لیکوئیدیتی (قدرت حرکت)
+    vol_liq = (volume_24h / liquidity) if liquidity > 0 else 0.0
+
+    # ۱) مومنتوم ۲۴ساعته با تأیید حجم
+    if ch24 is not None:
+        if 12 <= ch24 <= 45 and vol_liq >= 0.8:
+            pa += 8
+            tags.append("MomentumUp")
+            reasons.append(f"PA: مومنتوم صعودی با حجم ({ch24:.1f}%)")
+        elif 45 < ch24 <= 90 and vol_liq >= 1.2:
+            pa += 6
+            tags.append("StrongTrend")
+            reasons.append(f"PA: روند قوی ۲۴س ({ch24:.1f}%)")
+            warnings.append("رشد تند → احتمال پولبک")
+        elif ch24 > 90:
+            pa += 2
+            tags.append("Parabolic")
+            reasons.append(f"PA: حرکت پارابولیک ({ch24:.1f}%)")
+            warnings.append("ریسک برگشت بالا")
+        elif -8 <= ch24 < 0 and vol_liq >= 0.6:
+            pa += 3
+            tags.append("HealthyPullback")
+            reasons.append(f"PA: پولبک سالم ({ch24:.1f}%)")
+        elif ch24 < -20:
+            pa -= 4
+            tags.append("SellingPressure")
+            warnings.append(f"PA: فشار فروش قوی ({ch24:.1f}%)")
+
+    # ۲) مومنتوم کوتاه‌مدت ۱ساعته
+    if ch1 is not None:
+        if ch1 >= 4 and (ch24 is None or ch24 > 0):
+            pa += 4
+            tags.append("ShortMomentum")
+            reasons.append(f"PA: مومنتوم ۱س مثبت ({ch1:.1f}%)")
+        elif ch1 <= -5:
+            pa -= 3
+            tags.append("ShortWeakness")
+            warnings.append(f"PA: ضعف ۱س ({ch1:.1f}%)")
+
+    # ۳) ساختار خرید/فروش (order flow ساده)
+    total_tx = buys + sells
+    if total_tx >= 25:
+        buy_ratio = buys / total_tx
+        if buy_ratio >= 0.62:
+            pa += 5
+            tags.append("BuyerDominance")
+            reasons.append(f"PA: غلبه خریداران ({buy_ratio*100:.0f}%)")
+        elif buy_ratio <= 0.40:
+            pa -= 3
+            tags.append("SellerDominance")
+            warnings.append(f"PA: غلبه فروشندگان ({(1-buy_ratio)*100:.0f}%)")
+
+    # ۴) قدرت نسبی حجم (breakout-like)
+    if vol_liq >= 2.0 and ch24 is not None and ch24 > 5:
+        pa += 4
+        tags.append("VolumeBreak")
+        reasons.append("PA: شکست حجمی / فعالیت بالا")
+    elif vol_liq < 0.15 and volume_24h > 0:
+        pa -= 2
+        tags.append("LowActivity")
+        warnings.append("PA: فعالیت حجمی ضعیف")
+
+    # نرمال‌سازی
+    pa = max(0, min(20, int(pa)))
+    # تگ‌های تکراری را حذف کن
+    tags = list(dict.fromkeys(tags))
+    return pa, tags, reasons, warnings
 
 
 def calculate_score_from_metrics(
@@ -178,102 +269,153 @@ def calculate_score_from_metrics(
     confidence = 40
     risk_base = "متوسط"
 
-    if liquidity > 0: confidence += 12
-    if volume_24h > 0: confidence += 10
-    if market_cap > 0: confidence += 10
-    if price_change_24h is not None: confidence += 8
-    if has_rank: confidence += 12
-    if age_h is not None: confidence += 8
+    if liquidity > 0:
+        confidence += 12
+    if volume_24h > 0:
+        confidence += 10
+    if market_cap > 0:
+        confidence += 10
+    if price_change_24h is not None:
+        confidence += 8
+    if has_rank:
+        confidence += 12
+    if age_h is not None:
+        confidence += 8
     confidence = min(100, confidence)
 
     if liquidity >= 400000:
-        score += 22; reasons.append(f"لیکوئیدیتی عالی: ${liquidity:,.0f}")
+        score += 22
+        reasons.append(f"لیکوئیدیتی عالی: ${liquidity:,.0f}")
     elif liquidity >= 150000:
-        score += 17; reasons.append(f"لیکوئیدیتی خوب: ${liquidity:,.0f}")
+        score += 17
+        reasons.append(f"لیکوئیدیتی خوب: ${liquidity:,.0f}")
     elif liquidity >= 50000:
-        score += 12; reasons.append(f"لیکوئیدیتی قابل قبول: ${liquidity:,.0f}")
+        score += 12
+        reasons.append(f"لیکوئیدیتی قابل قبول: ${liquidity:,.0f}")
     elif liquidity >= 15000:
-        score += 6; reasons.append(f"لیکوئیدیتی متوسط: ${liquidity:,.0f}"); warnings.append("لغزش متوسط ممکن است")
+        score += 6
+        reasons.append(f"لیکوئیدیتی متوسط: ${liquidity:,.0f}")
+        warnings.append("لغزش متوسط ممکن است")
     elif liquidity >= 5000:
-        score += 2; reasons.append(f"لیکوئیدیتی کم: ${liquidity:,.0f}"); warnings.append("لغزش بالا")
+        score += 2
+        reasons.append(f"لیکوئیدیتی کم: ${liquidity:,.0f}")
+        warnings.append("لغزش بالا")
     elif liquidity > 0:
-        reasons.append(f"لیکوئیدیتی خیلی کم: ${liquidity:,.0f}"); warnings.append("ریسک نقدشوندگی"); score -= 5
+        reasons.append(f"لیکوئیدیتی خیلی کم: ${liquidity:,.0f}")
+        warnings.append("ریسک نقدشوندگی")
+        score -= 5
     else:
         reasons.append("لیکوئیدیتی دکس نامشخص (ممکن است بیشتر CEX باشد)")
 
     if volume_24h >= 800000:
-        score += 16; reasons.append(f"حجم بسیار بالا: ${volume_24h:,.0f}")
+        score += 16
+        reasons.append(f"حجم بسیار بالا: ${volume_24h:,.0f}")
     elif volume_24h >= 200000:
-        score += 12; reasons.append(f"حجم خوب: ${volume_24h:,.0f}")
+        score += 12
+        reasons.append(f"حجم خوب: ${volume_24h:,.0f}")
     elif volume_24h >= 60000:
-        score += 8; reasons.append(f"حجم متوسط رو به بالا: ${volume_24h:,.0f}")
+        score += 8
+        reasons.append(f"حجم متوسط رو به بالا: ${volume_24h:,.0f}")
     elif volume_24h >= 20000:
-        score += 4; reasons.append(f"حجم متوسط: ${volume_24h:,.0f}")
+        score += 4
+        reasons.append(f"حجم متوسط: ${volume_24h:,.0f}")
     elif volume_24h > 0:
-        score += 1; reasons.append(f"حجم کم: ${volume_24h:,.0f}")
+        score += 1
+        reasons.append(f"حجم کم: ${volume_24h:,.0f}")
     else:
         reasons.append("حجم دکس کم/نامشخص")
 
     if liquidity > 0 and volume_24h > 0:
         vol_liq = volume_24h / liquidity
         if vol_liq >= 2.0:
-            score += 5; reasons.append("نسبت حجم/لیکوئیدیتی قوی")
+            score += 5
+            reasons.append("نسبت حجم/لیکوئیدیتی قوی")
         elif vol_liq >= 0.7:
             score += 2
         elif vol_liq < 0.12:
-            score -= 8; warnings.append("حجم نسبت به لیکوئیدیتی ضعیف")
+            score -= 8
+            warnings.append("حجم نسبت به لیکوئیدیتی ضعیف")
 
     if rank and rank <= 300:
-        score += 14; reasons.append(f"رتبه مارکت‌کپ خوب: #{rank}"); risk_base = "کم تا متوسط"
+        score += 14
+        reasons.append(f"رتبه مارکت‌کپ خوب: #{rank}")
+        risk_base = "کم تا متوسط"
     elif rank and rank <= 800:
-        score += 11; reasons.append(f"رتبه مارکت‌کپ متوسط: #{rank}"); risk_base = "متوسط"
+        score += 11
+        reasons.append(f"رتبه مارکت‌کپ متوسط: #{rank}")
+        risk_base = "متوسط"
     elif rank and rank <= 2000:
-        score += 8; reasons.append(f"رتبه مارکت‌کپ: #{rank}"); risk_base = "متوسط تا بالا"
+        score += 8
+        reasons.append(f"رتبه مارکت‌کپ: #{rank}")
+        risk_base = "متوسط تا بالا"
     elif 0 < market_cap < 2_500_000:
-        score += 10; reasons.append(f"مارکت‌کپ خیلی کم: ${market_cap:,.0f}"); risk_base = "بالا"
+        score += 10
+        reasons.append(f"مارکت‌کپ خیلی کم: ${market_cap:,.0f}")
+        risk_base = "بالا"
     elif 2_500_000 <= market_cap < 25_000_000:
-        score += 15; reasons.append(f"مارکت‌کپ مناسب (کم‌کپ): ${market_cap:,.0f}"); risk_base = "متوسط تا بالا"
+        score += 15
+        reasons.append(f"مارکت‌کپ مناسب (کم‌کپ): ${market_cap:,.0f}")
+        risk_base = "متوسط تا بالا"
     elif 25_000_000 <= market_cap < 150_000_000:
-        score += 12; reasons.append(f"مارکت‌کپ متوسط: ${market_cap:,.0f}"); risk_base = "متوسط"
+        score += 12
+        reasons.append(f"مارکت‌کپ متوسط: ${market_cap:,.0f}")
+        risk_base = "متوسط"
     elif market_cap >= 150_000_000:
-        score += 7; reasons.append(f"مارکت‌کپ نسبتاً بالا: ${market_cap:,.0f}"); risk_base = "کم تا متوسط"
+        score += 7
+        reasons.append(f"مارکت‌کپ نسبتاً بالا: ${market_cap:,.0f}")
+        risk_base = "کم تا متوسط"
     else:
         reasons.append("مارکت‌کپ نامشخص")
 
     if price_change_24h is None:
-        reasons.append("تغییر ۲۴س نامشخص"); score += 3
+        reasons.append("تغییر ۲۴س نامشخص")
+        score += 3
     elif 8 <= price_change_24h <= 55:
-        score += 14; reasons.append(f"رشد ۲۴س معقول: {price_change_24h:.1f}%")
+        score += 14
+        reasons.append(f"رشد ۲۴س معقول: {price_change_24h:.1f}%")
     elif 55 < price_change_24h <= 120:
-        score += 9; reasons.append(f"رشد ۲۴س قوی: {price_change_24h:.1f}%"); warnings.append("رشد زیاد → احتمال پولبک")
+        score += 9
+        reasons.append(f"رشد ۲۴س قوی: {price_change_24h:.1f}%")
+        warnings.append("رشد زیاد → احتمال پولبک")
     elif price_change_24h > 120:
-        score += 3; reasons.append(f"رشد بسیار زیاد: {price_change_24h:.1f}%"); warnings.append("احتمال FOMO")
+        score += 3
+        reasons.append(f"رشد بسیار زیاد: {price_change_24h:.1f}%")
+        warnings.append("احتمال FOMO")
     elif 0 <= price_change_24h < 8:
-        score += 7; reasons.append(f"نوسان ملایم: {price_change_24h:.1f}%")
+        score += 7
+        reasons.append(f"نوسان ملایم: {price_change_24h:.1f}%")
     elif -15 <= price_change_24h < 0:
-        score += 4; reasons.append(f"اصلاح خفیف: {price_change_24h:.1f}%")
+        score += 4
+        reasons.append(f"اصلاح خفیف: {price_change_24h:.1f}%")
     else:
-        reasons.append(f"ریزش: {price_change_24h:.1f}%"); warnings.append("فشار فروش")
+        reasons.append(f"ریزش: {price_change_24h:.1f}%")
+        warnings.append("فشار فروش")
 
     if price_change_1h is not None:
         if price_change_1h > 3:
-            score += 3; reasons.append(f"مومنتوم ۱س مثبت: {price_change_1h:.1f}%")
+            score += 3
+            reasons.append(f"مومنتوم ۱س مثبت: {price_change_1h:.1f}%")
         elif price_change_1h < -6:
-            score -= 4; warnings.append(f"فشار فروش ۱س: {price_change_1h:.1f}%")
+            score -= 4
+            warnings.append(f"فشار فروش ۱س: {price_change_1h:.1f}%")
 
     total_tx = buys + sells
     if total_tx > 20:
         buy_ratio = buys / total_tx
         if buy_ratio >= 0.58:
-            score += 8; reasons.append(f"غلبه خریداران: {buy_ratio*100:.0f}%")
+            score += 8
+            reasons.append(f"غلبه خریداران: {buy_ratio*100:.0f}%")
         elif buy_ratio < 0.42:
-            score -= 3; warnings.append("غلبه فروشندگان")
+            score -= 3
+            warnings.append("غلبه فروشندگان")
 
     if age_h is not None:
         if age_h >= 24 * 30:
-            score += 4; reasons.append(f"جفت/بازار بالغ ({age_h/24:.0f} روز)")
+            score += 4
+            reasons.append(f"جفت/بازار بالغ ({age_h/24:.0f} روز)")
         elif age_h < 4:
-            score -= 3; warnings.append(f"بسیار جدید ({age_h:.1f} ساعت)")
+            score -= 3
+            warnings.append(f"بسیار جدید ({age_h:.1f} ساعت)")
 
     score = max(0, min(100, int(score)))
     return score, reasons, warnings, risk_base, confidence
@@ -351,6 +493,8 @@ def analyze_token(symbol: str = None, address: str = None) -> Dict[str, Any]:
             "confidence": 0,
             "position_suggestion": "هیچ",
             "asset_kind": "unknown",
+            "pa_score": 0,
+            "pa_tags": [],
         }
 
     score, reasons, warnings, risk_base, confidence = calculate_score_from_metrics(
@@ -365,6 +509,20 @@ def analyze_token(symbol: str = None, address: str = None) -> Dict[str, Any]:
         has_rank=rank is not None,
         rank=rank,
     )
+
+    # لایه Price Action
+    pa_score, pa_tags, pa_reasons, pa_warnings = calculate_price_action_score(
+        price_change_24h=price_change_24h,
+        price_change_1h=price_change_1h,
+        volume_24h=volume_24h,
+        liquidity=liquidity,
+        buys=buys,
+        sells=sells,
+    )
+    # حداکثر ۲۰ امتیاز از PA به امتیاز اصلی اضافه می‌شود (با سقف ۱۰۰)
+    score = max(0, min(100, score + pa_score))
+    reasons = pa_reasons + reasons
+    warnings = pa_warnings + warnings
 
     asset_kind = detect_asset_kind(base_sym or (symbol or ""), base_name, price_usd)
     if asset_kind.startswith("stock"):
@@ -415,6 +573,8 @@ def analyze_token(symbol: str = None, address: str = None) -> Dict[str, Any]:
         "price_str": format_price(price_usd),
         "rank": rank,
         "asset_kind": asset_kind,
+        "pa_score": pa_score,
+        "pa_tags": pa_tags,
         "links": {
             "dexscreener": pair_url,
             "coingecko": cg_url,
@@ -430,5 +590,5 @@ def analyze_token(symbol: str = None, address: str = None) -> Dict[str, Any]:
             "chain": chain or None,
             "dex": dex or None,
         },
-        "note": "نسخه ۰.۹.۱ | Dex + CoinGecko + تگ سهام/پرپ | NFA | DYOR"
+        "note": "نسخه ۱.۰.۰ | Dex + CoinGecko + PA لایه سبک | NFA | DYOR"
     }
