@@ -1,6 +1,6 @@
 """
-BITFA Signal Scorer - Version 1.0.0
-تگ سهام/پرپ + لایه Price Action سبک (الهام از stolgo / Al Brooks style)
+BITFA Signal Scorer - Version 1.0.1
+تگ سهام/پرپ + لایه Price Action + جستجوی قرارداد CoinGecko
 """
 
 import os
@@ -11,7 +11,13 @@ from datetime import datetime, timezone
 COINGECKO_KEY = os.getenv("COINGECKO_API_KEY", "")
 CG_BASE = "https://api.coingecko.com/api/v3"
 
-# نمادهایی که در واچ‌لیست بیتفا بیشتر سهام/پرپ هستند تا آلت‌کوین
+# پلتفرم‌های رایج CoinGecko برای جستجوی قرارداد
+CG_PLATFORMS = [
+    "ethereum", "binance-smart-chain", "polygon-pos", "arbitrum-one", "base",
+    "optimistic-ethereum", "avalanche", "fantom", "plume-network", "solana",
+    "sui", "ton", "tron",
+]
+
 STOCK_LIKE = {
     "AMD", "SKDD", "HANMI", "ZHONGJI", "TSLA", "AAPL", "NVDA", "META", "GOOGL",
     "AMZN", "MSFT", "COIN", "MSTR", "HOOD", "PLTR", "NFLX", "BABA", "INTC"
@@ -67,6 +73,28 @@ def coingecko_search(symbol: str) -> Optional[Dict]:
     except Exception as e:
         print(f"CG search error: {e}")
         return None
+
+
+def coingecko_by_contract(address: str) -> Optional[Dict]:
+    """جستجوی توکن با آدرس قرارداد روی چند پلتفرم CoinGecko (مثل Plume)."""
+    if not address:
+        return None
+    addr = address.strip()
+    for platform in CG_PLATFORMS:
+        try:
+            r = requests.get(
+                f"{CG_BASE}/coins/{platform}/contract/{addr}",
+                headers=cg_headers(),
+                timeout=10,
+            )
+            if r.status_code == 200:
+                data = r.json() or {}
+                if data.get("id"):
+                    return data
+        except Exception as e:
+            print(f"CG contract {platform} error: {e}")
+            continue
+    return None
 
 
 def coingecko_market(coin_id: str) -> Optional[Dict]:
@@ -166,13 +194,6 @@ def calculate_price_action_score(
     buys: float,
     sells: float,
 ) -> Tuple[int, List[str], List[str], List[str]]:
-    """
-    لایه سبک Price Action (الهام از مفاهیم stolgo / Al Brooks):
-    - مومنتوم + تأیید حجم
-    - غلبه خرید/فروش
-    - تشخیص فشار یا شکست ساختار ساده
-    امتیاز ۰ تا ۲۰ که به امتیاز اصلی اضافه می‌شود.
-    """
     pa = 0
     tags: List[str] = []
     reasons: List[str] = []
@@ -180,11 +201,8 @@ def calculate_price_action_score(
 
     ch24 = price_change_24h
     ch1 = price_change_1h
-
-    # نسبت حجم به لیکوئیدیتی (قدرت حرکت)
     vol_liq = (volume_24h / liquidity) if liquidity > 0 else 0.0
 
-    # ۱) مومنتوم ۲۴ساعته با تأیید حجم
     if ch24 is not None:
         if 12 <= ch24 <= 45 and vol_liq >= 0.8:
             pa += 8
@@ -209,7 +227,6 @@ def calculate_price_action_score(
             tags.append("SellingPressure")
             warnings.append(f"PA: فشار فروش قوی ({ch24:.1f}%)")
 
-    # ۲) مومنتوم کوتاه‌مدت ۱ساعته
     if ch1 is not None:
         if ch1 >= 4 and (ch24 is None or ch24 > 0):
             pa += 4
@@ -220,7 +237,6 @@ def calculate_price_action_score(
             tags.append("ShortWeakness")
             warnings.append(f"PA: ضعف ۱س ({ch1:.1f}%)")
 
-    # ۳) ساختار خرید/فروش (order flow ساده)
     total_tx = buys + sells
     if total_tx >= 25:
         buy_ratio = buys / total_tx
@@ -233,7 +249,6 @@ def calculate_price_action_score(
             tags.append("SellerDominance")
             warnings.append(f"PA: غلبه فروشندگان ({(1-buy_ratio)*100:.0f}%)")
 
-    # ۴) قدرت نسبی حجم (breakout-like)
     if vol_liq >= 2.0 and ch24 is not None and ch24 > 5:
         pa += 4
         tags.append("VolumeBreak")
@@ -243,9 +258,7 @@ def calculate_price_action_score(
         tags.append("LowActivity")
         warnings.append("PA: فعالیت حجمی ضعیف")
 
-    # نرمال‌سازی
     pa = max(0, min(20, int(pa)))
-    # تگ‌های تکراری را حذف کن
     tags = list(dict.fromkeys(tags))
     return pa, tags, reasons, warnings
 
@@ -460,33 +473,58 @@ def analyze_token(symbol: str = None, address: str = None) -> Dict[str, Any]:
     cg_mkt = None
     rank = None
     cg_url = None
+    cg_coin_id = None
+
+    # ۱) اگر از Dex نماد داریم → جستجوی نماد در CG
     search_sym = (base_sym if base_sym and base_sym != "?" else symbol) or None
     if search_sym:
         cg_hit = coingecko_search(search_sym)
         if cg_hit:
-            cg_mkt = coingecko_market(cg_hit.get("id"))
-            if cg_mkt:
-                rank = cg_mkt.get("market_cap_rank")
-                if price_usd is None:
-                    price_usd = safe_float(cg_mkt.get("current_price"), None)
-                if market_cap <= 0:
-                    market_cap = safe_float(cg_mkt.get("market_cap"), 0)
-                if price_change_24h is None:
-                    price_change_24h = safe_float(cg_mkt.get("price_change_percentage_24h"), None)
-                if price_change_1h is None:
-                    price_change_1h = safe_float(cg_mkt.get("price_change_percentage_1h_in_currency"), None)
-                if not base_name:
-                    base_name = cg_mkt.get("name") or cg_hit.get("name") or ""
-                if not base_sym or base_sym == "?":
-                    base_sym = (cg_mkt.get("symbol") or search_sym or "?").upper()
-                cg_vol = safe_float(cg_mkt.get("total_volume"), 0)
-                if cg_vol > volume_24h:
-                    volume_24h = max(volume_24h, cg_vol * 0.15)
-                cg_url = f"https://www.coingecko.com/en/coins/{cg_hit.get('id')}"
+            cg_coin_id = cg_hit.get("id")
 
-    if not pair and not cg_mkt:
+    # ۲) اگر فقط آدرس داریم و هنوز CG پیدا نشد → جستجوی قرارداد
+    if not cg_coin_id and address:
+        cg_contract = coingecko_by_contract(address)
+        if cg_contract:
+            cg_coin_id = cg_contract.get("id")
+            if not base_name:
+                base_name = cg_contract.get("name") or ""
+            if not base_sym or base_sym == "?":
+                base_sym = (cg_contract.get("symbol") or "?").upper()
+            token_address = token_address or address
+            # اگر market data داخل پاسخ contract بود
+            md = (cg_contract.get("market_data") or {})
+            if price_usd is None and md.get("current_price"):
+                price_usd = safe_float((md.get("current_price") or {}).get("usd"), None)
+            if market_cap <= 0 and md.get("market_cap"):
+                market_cap = safe_float((md.get("market_cap") or {}).get("usd"), 0)
+            if price_change_24h is None and md.get("price_change_percentage_24h") is not None:
+                price_change_24h = safe_float(md.get("price_change_percentage_24h"), None)
+
+    if cg_coin_id:
+        cg_mkt = coingecko_market(cg_coin_id)
+        if cg_mkt:
+            rank = cg_mkt.get("market_cap_rank")
+            if price_usd is None:
+                price_usd = safe_float(cg_mkt.get("current_price"), None)
+            if market_cap <= 0:
+                market_cap = safe_float(cg_mkt.get("market_cap"), 0)
+            if price_change_24h is None:
+                price_change_24h = safe_float(cg_mkt.get("price_change_percentage_24h"), None)
+            if price_change_1h is None:
+                price_change_1h = safe_float(cg_mkt.get("price_change_percentage_1h_in_currency"), None)
+            if not base_name:
+                base_name = cg_mkt.get("name") or ""
+            if not base_sym or base_sym == "?":
+                base_sym = (cg_mkt.get("symbol") or "?").upper()
+            cg_vol = safe_float(cg_mkt.get("total_volume"), 0)
+            if cg_vol > volume_24h:
+                volume_24h = max(volume_24h, cg_vol * 0.15)
+            cg_url = f"https://www.coingecko.com/en/coins/{cg_coin_id}"
+
+    if not pair and not cg_mkt and not cg_coin_id:
         return {
-            "error": "داده پیدا نشد (نه در دکس و نه در CoinGecko)",
+            "error": "داده پیدا نشد (نه در دکس و نه در CoinGecko). ممکن است زنجیره پشتیبانی‌نشده باشد.",
             "score": 0,
             "category": "SKIP",
             "recommendation": "رد",
@@ -510,7 +548,6 @@ def analyze_token(symbol: str = None, address: str = None) -> Dict[str, Any]:
         rank=rank,
     )
 
-    # لایه Price Action
     pa_score, pa_tags, pa_reasons, pa_warnings = calculate_price_action_score(
         price_change_24h=price_change_24h,
         price_change_1h=price_change_1h,
@@ -519,7 +556,6 @@ def analyze_token(symbol: str = None, address: str = None) -> Dict[str, Any]:
         buys=buys,
         sells=sells,
     )
-    # حداکثر ۲۰ امتیاز از PA به امتیاز اصلی اضافه می‌شود (با سقف ۱۰۰)
     score = max(0, min(100, score + pa_score))
     reasons = pa_reasons + reasons
     warnings = pa_warnings + warnings
@@ -528,7 +564,7 @@ def analyze_token(symbol: str = None, address: str = None) -> Dict[str, Any]:
     if asset_kind.startswith("stock"):
         reasons.insert(0, "نوع دارایی: سهام/پرپ (نه آلت‌کوین معمولی)")
         warnings.append("این مورد را با توکن‌های کریپتو قاطی نکن")
-    elif rank:
+    elif rank or cg_coin_id:
         reasons.insert(0, f"منبع بازار: CoinGecko + Dex" if pair else "منبع بازار: CoinGecko")
     elif pair:
         reasons.insert(0, "منبع بازار: عمدتاً DexScreener")
@@ -590,5 +626,5 @@ def analyze_token(symbol: str = None, address: str = None) -> Dict[str, Any]:
             "chain": chain or None,
             "dex": dex or None,
         },
-        "note": "نسخه ۱.۰.۰ | Dex + CoinGecko + PA لایه سبک | NFA | DYOR"
+        "note": "نسخه ۱.۰.۱ | Dex + CoinGecko contract lookup + PA | NFA | DYOR"
     }
