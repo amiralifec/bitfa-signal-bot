@@ -1,6 +1,6 @@
 """
-BITFA Signal Scorer - Version 1.0.1
-تگ سهام/پرپ + لایه Price Action + جستجوی قرارداد CoinGecko
+BITFA Signal Scorer - Version 1.0.2
+تگ سهام/پرپ سخت‌گیرانه + لایه Price Action + جستجوی قرارداد CoinGecko
 """
 
 import os
@@ -11,7 +11,6 @@ from datetime import datetime, timezone
 COINGECKO_KEY = os.getenv("COINGECKO_API_KEY", "")
 CG_BASE = "https://api.coingecko.com/api/v3"
 
-# پلتفرم‌های رایج CoinGecko برای جستجوی قرارداد
 CG_PLATFORMS = [
     "ethereum", "binance-smart-chain", "polygon-pos", "arbitrum-one", "base",
     "optimistic-ethereum", "avalanche", "fantom", "plume-network", "solana",
@@ -76,7 +75,6 @@ def coingecko_search(symbol: str) -> Optional[Dict]:
 
 
 def coingecko_by_contract(address: str) -> Optional[Dict]:
-    """جستجوی توکن با آدرس قرارداد روی چند پلتفرم CoinGecko (مثل Plume)."""
     if not address:
         return None
     addr = address.strip()
@@ -170,18 +168,62 @@ def format_price(price_usd: Optional[float]) -> Optional[str]:
     return f"${price_usd:.8f}"
 
 
-def detect_asset_kind(symbol: str, name: str, price_usd: Optional[float]) -> str:
+def detect_asset_kind(
+    symbol: str,
+    name: str,
+    price_usd: Optional[float],
+    *,
+    liquidity: float = 0.0,
+    market_cap: float = 0.0,
+    rank: Optional[int] = None,
+    has_dex_pair: bool = False,
+) -> str:
+    """
+    سخت‌گیرانه:
+    - فقط نماد STOCK_LIKE + شواهد سهام → stock_perp
+    - AMD جعلی با قیمت خیلی پایین روی دکس → crypto (با هشدار جدا)
+    """
     sym = (symbol or "").upper()
     name_l = (name or "").lower()
+
+    stock_name_hint = any(
+        k in name_l
+        for k in (
+            "inc.", "inc ", "corp", "corporation", "semiconductor", "etf",
+            "shares", "nasdaq", "nyse", "equity", "holdings plc", "class a",
+        )
+    )
+
+    if stock_name_hint and sym in STOCK_LIKE:
+        return "stock_perp"
+
     if sym in STOCK_LIKE:
-        return "stock_perp"
-    if any(k in name_l for k in ["inc.", "corp", "semiconductor", "etf", "shares", "nasdaq", "equity"]):
-        return "stock_perp"
-    if price_usd is not None and price_usd >= 50 and sym in STOCK_LIKE:
-        return "stock_perp"
-    if price_usd is not None and price_usd >= 100 and len(sym) <= 5:
-        if sym not in {"BTC", "ETH", "BNB", "SOL"}:
+        realistic_stock_price = price_usd is not None and price_usd >= 5.0
+        big_cap_no_meme = (
+            (market_cap >= 1_000_000_000 or (rank is not None and rank <= 50))
+            and liquidity < 50_000
+        )
+        looks_like_spoof = (
+            has_dex_pair
+            and price_usd is not None
+            and price_usd < 1.0
+            and (market_cap < 50_000_000 or market_cap == 0)
+        )
+        if looks_like_spoof:
+            return "crypto"
+        if realistic_stock_price or big_cap_no_meme:
+            return "stock_perp"
+        if price_usd is not None and price_usd >= 1.0:
             return "stock_perp_candidate"
+        return "crypto"
+
+    if stock_name_hint:
+        return "stock_perp"
+
+    if price_usd is not None and price_usd >= 100 and len(sym) <= 5:
+        if sym not in {"BTC", "ETH", "BNB", "SOL", "XRP", "ADA", "DOGE", "TRX", "TON", "AVAX"}:
+            return "stock_perp_candidate"
+
     return "crypto"
 
 
@@ -475,14 +517,12 @@ def analyze_token(symbol: str = None, address: str = None) -> Dict[str, Any]:
     cg_url = None
     cg_coin_id = None
 
-    # ۱) اگر از Dex نماد داریم → جستجوی نماد در CG
     search_sym = (base_sym if base_sym and base_sym != "?" else symbol) or None
     if search_sym:
         cg_hit = coingecko_search(search_sym)
         if cg_hit:
             cg_coin_id = cg_hit.get("id")
 
-    # ۲) اگر فقط آدرس داریم و هنوز CG پیدا نشد → جستجوی قرارداد
     if not cg_coin_id and address:
         cg_contract = coingecko_by_contract(address)
         if cg_contract:
@@ -492,7 +532,6 @@ def analyze_token(symbol: str = None, address: str = None) -> Dict[str, Any]:
             if not base_sym or base_sym == "?":
                 base_sym = (cg_contract.get("symbol") or "?").upper()
             token_address = token_address or address
-            # اگر market data داخل پاسخ contract بود
             md = (cg_contract.get("market_data") or {})
             if price_usd is None and md.get("current_price"):
                 price_usd = safe_float((md.get("current_price") or {}).get("usd"), None)
@@ -560,7 +599,17 @@ def analyze_token(symbol: str = None, address: str = None) -> Dict[str, Any]:
     reasons = pa_reasons + reasons
     warnings = pa_warnings + warnings
 
-    asset_kind = detect_asset_kind(base_sym or (symbol or ""), base_name, price_usd)
+    asset_kind = detect_asset_kind(
+        base_sym or (symbol or ""),
+        base_name,
+        price_usd,
+        liquidity=liquidity,
+        market_cap=market_cap,
+        rank=rank,
+        has_dex_pair=bool(pair),
+    )
+    if (base_sym or (symbol or "")).upper() in STOCK_LIKE and asset_kind == "crypto":
+        warnings.append("نماد هم‌نام با سهام/پرپ معروف — این داده بیشتر شبیه توکن کریپتو است، با سهام واقعی قاطی نکن")
     if asset_kind.startswith("stock"):
         reasons.insert(0, "نوع دارایی: سهام/پرپ (نه آلت‌کوین معمولی)")
         warnings.append("این مورد را با توکن‌های کریپتو قاطی نکن")
@@ -626,5 +675,5 @@ def analyze_token(symbol: str = None, address: str = None) -> Dict[str, Any]:
             "chain": chain or None,
             "dex": dex or None,
         },
-        "note": "نسخه ۱.۰.۱ | Dex + CoinGecko contract lookup + PA | NFA | DYOR"
+        "note": "نسخه ۱.۰.۲ | Dex + CG + PA + stock harden | NFA | DYOR"
     }
