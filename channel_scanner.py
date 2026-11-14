@@ -1,5 +1,5 @@
 """
-خواندن کانال BITFA - با timeout + یادداشت تحلیلگر از PDF
+خواندن کانال BITFA - timeout + یادداشت تحلیلگر + حافظه اسکن
 """
 
 import os
@@ -12,6 +12,7 @@ from telethon.tl.types import MessageMediaDocument
 
 from scorer import analyze_token
 from pdf_parser import parse_watchlist_pdf, extract_tickers_from_text
+from storage import load_last_scan, save_last_scan, diff_with_previous
 
 API_ID = int(os.getenv("TELEGRAM_API_ID") or os.getenv("API_ID") or "0")
 API_HASH = os.getenv("TELEGRAM_API_HASH") or os.getenv("API_HASH") or ""
@@ -108,7 +109,6 @@ async def fetch_recent_tickers(limit_messages: int = 30) -> Dict[str, Any]:
                         for t in parsed.get("tickers") or []:
                             if t not in pdf_tickers:
                                 pdf_tickers.append(t)
-                        # ادغام notes
                         for k, v in (parsed.get("notes_map") or {}).items():
                             if k not in notes_map or (v.get("analyst_note") and not notes_map[k].get("analyst_note")):
                                 notes_map[k] = v
@@ -197,7 +197,6 @@ def _apply_note_to_result(r: dict, note_info: dict) -> dict:
             reasons.insert(0, f"یادداشت تحلیلگر BITFA: محتاطانه ({boost})")
         r["reasons"] = reasons
 
-        # دسته را با امتیاز جدید هماهنگ کن
         conf = int(r.get("confidence") or 0)
         if new_score >= 80 and conf >= 70:
             r["category"], r["recommendation"], r["action"] = "HOT", "امتیاز عالی - قابل بررسی جدی برای ورود محدود", "اولویت بررسی"
@@ -211,7 +210,7 @@ def _apply_note_to_result(r: dict, note_info: dict) -> dict:
     return r
 
 
-async def scan_and_score(limit_messages: int = 30) -> Dict[str, Any]:
+async def scan_and_score(limit_messages: int = 30, persist: bool = True) -> Dict[str, Any]:
     meta = await fetch_recent_tickers(limit_messages=limit_messages)
     if meta.get("error"):
         return meta
@@ -228,6 +227,7 @@ async def scan_and_score(limit_messages: int = 30) -> Dict[str, Any]:
             "results": [],
             "error": None,
             "note": "تیکری پیدا نشد",
+            "diff": {"new": [], "improved": [], "dropped": [], "unchanged_hot": []},
         }
 
     scored_rows: List[Tuple[int, str, dict]] = []
@@ -245,13 +245,28 @@ async def scan_and_score(limit_messages: int = 30) -> Dict[str, Any]:
 
     summary = {"HOT": [], "QUALIFIED": [], "WATCH": [], "SKIP": []}
     results = []
+    current_map: Dict[str, Dict[str, Any]] = {}
+
     for score, t, r in scored_rows:
         cat = r.get("category", "SKIP")
         if cat not in summary:
             cat = "SKIP"
-        label = f"#{r.get('token') or t} ({score})"
+        token = (r.get("token") or t).upper()
+        label = f"#{token} ({score})"
         summary[cat].append(label)
         results.append({"ticker": t, "result": r})
+        current_map[token] = {
+            "score": score,
+            "category": cat,
+            "token": token,
+            "pa_score": r.get("pa_score"),
+        }
+
+    prev = load_last_scan()
+    diff = diff_with_previous(current_map, prev)
+
+    if persist:
+        save_last_scan(current_map)
 
     focus = [x for x in results if (x["result"].get("category") in ("HOT", "QUALIFIED", "WATCH"))]
     skips = [x for x in results if x["result"].get("category") == "SKIP"][:4]
@@ -267,4 +282,5 @@ async def scan_and_score(limit_messages: int = 30) -> Dict[str, Any]:
         "summary": summary,
         "results": focus + skips,
         "samples": meta.get("samples", []),
+        "diff": diff,
     }
