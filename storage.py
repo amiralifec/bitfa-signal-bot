@@ -9,6 +9,8 @@ from typing import Dict, Any, List, Optional
 
 STORE_PATH = os.getenv("SCAN_STORE_PATH", "last_scan.json")
 
+CAT_RANK = {"SKIP": 0, "WATCH": 1, "QUALIFIED": 2, "HOT": 3}
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -30,9 +32,6 @@ def load_last_scan() -> Dict[str, Any]:
 
 
 def save_last_scan(ticker_scores: Dict[str, Dict[str, Any]]) -> None:
-    """
-    ticker_scores: { "FOOD": {"score": 76, "category": "QUALIFIED", "token": "FOOD"}, ... }
-    """
     try:
         payload = {
             "updated_at": _now_iso(),
@@ -49,37 +48,53 @@ def diff_with_previous(
     previous: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    خروجی:
-      new: تیکرهایی که قبلاً نبودند
-      improved: امتیازشان حداقل +8 شده
-      dropped: قبلاً HOT/QUALIFIED بودند و الان نیستند
-      unchanged_hot: همان‌های خوب تکراری
+    new / improved (+8) / declined (-8) / upgraded (category up) / dropped / deltas
     """
-    prev = (previous or load_last_scan()).get("tickers") or {}
+    prev_full = previous if previous is not None else load_last_scan()
+    prev = (prev_full or {}).get("tickers") or {}
+
     new_list: List[str] = []
     improved: List[str] = []
+    declined: List[str] = []
+    upgraded: List[str] = []
     dropped: List[str] = []
     unchanged_hot: List[str] = []
+    deltas: Dict[str, int] = {}
 
     for t, info in current.items():
         score = int(info.get("score") or 0)
         cat = info.get("category") or "SKIP"
-        old = prev.get(t) or prev.get(t.upper()) or {}
+        old = prev.get(t) or prev.get(str(t).upper()) or {}
         old_score = int(old.get("score") or 0)
         old_cat = old.get("category") or ""
+
+        if old:
+            delta = score - old_score
+            if delta != 0:
+                deltas[t] = delta
 
         if not old:
             if cat in ("HOT", "QUALIFIED", "WATCH"):
                 new_list.append(t)
-        elif score - old_score >= 8 and cat in ("HOT", "QUALIFIED", "WATCH"):
-            improved.append(t)
-        elif cat in ("HOT", "QUALIFIED") and old_cat in ("HOT", "QUALIFIED"):
+            continue
+
+        if CAT_RANK.get(cat, 0) > CAT_RANK.get(old_cat, 0) and cat in ("HOT", "QUALIFIED", "WATCH"):
+            upgraded.append(t)
+
+        if score - old_score >= 8 and cat in ("HOT", "QUALIFIED", "WATCH"):
+            if t not in improved:
+                improved.append(t)
+        elif old_score - score >= 8:
+            declined.append(t)
+
+        if cat in ("HOT", "QUALIFIED") and old_cat in ("HOT", "QUALIFIED") and abs(score - old_score) < 8:
             unchanged_hot.append(t)
 
     for t, old in prev.items():
         old_cat = old.get("category") or ""
         if old_cat in ("HOT", "QUALIFIED") and t not in current:
-            dropped.append(t)
+            if t not in dropped:
+                dropped.append(t)
         elif old_cat in ("HOT", "QUALIFIED"):
             cur = current.get(t) or {}
             if (cur.get("category") or "SKIP") not in ("HOT", "QUALIFIED", "WATCH"):
@@ -89,7 +104,10 @@ def diff_with_previous(
     return {
         "new": new_list,
         "improved": improved,
+        "declined": declined,
+        "upgraded": upgraded,
         "dropped": dropped,
         "unchanged_hot": unchanged_hot,
-        "prev_updated_at": (previous or load_last_scan()).get("updated_at"),
+        "deltas": deltas,
+        "prev_updated_at": (prev_full or {}).get("updated_at"),
     }
