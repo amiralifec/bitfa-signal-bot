@@ -1,6 +1,6 @@
 """
 BITFA Scorer + Telegram Bot
-نسخه ۱.۶.۱ - تگ‌های سرچ تلگرام
+نسخه ۱.۷.۰ - diff UP/DOWN + یادداشت روزانه
 """
 
 import os
@@ -25,7 +25,7 @@ WEBHOOK_BASE = os.getenv("RENDER_EXTERNAL_URL") or "https://bitfa-signal-bot.onr
 CRON_SECRET = os.getenv("CRON_SECRET") or ""
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID") or ""
 
-app = FastAPI(title="BITFA Signal Scorer", version="1.6.1")
+app = FastAPI(title="BITFA Signal Scorer", version="1.7.0")
 
 _scan_locks: Set[int] = set()
 _processed_updates: Set[int] = set()
@@ -78,14 +78,7 @@ def extract_tickers_and_addresses(text: str) -> List[str]:
                 t = part.upper()
                 if t not in STOPWORDS and t not in [x.upper() for x in items]:
                     items.append(t)
-    seen = set()
-    unique = []
-    for i in items:
-        key = i.lower()
-        if key not in seen:
-            seen.add(key)
-            unique.append(i)
-    return unique[:12]
+    return items[:20]
 
 
 def _pa_line(result: dict) -> str:
@@ -93,7 +86,13 @@ def _pa_line(result: dict) -> str:
     tags = result.get("pa_tags") or []
     if pa is None:
         return ""
-    tag_txt = ", ".join(tags[:3]) if tags else "-"
+    meaningful = [t for t in tags if t not in ("LowActivity", "Neutral", "-")]
+    if int(pa or 0) <= 0 and not meaningful:
+        return ""
+    if int(pa or 0) == 0 and tags == ["LowActivity"]:
+        return ""
+    show = meaningful or tags
+    tag_txt = ", ".join(show[:3]) if show else "-"
     return f" | PA:{pa}/20 ({tag_txt})"
 
 
@@ -161,9 +160,10 @@ def format_single(name: str, result: dict, badge: str = "") -> str:
     note_flag = " | 📝" if result.get("analyst_note") else ""
     badge_txt = f" {badge}" if badge else ""
     tags = _search_tags(token)
+    tags_line = f"\n{tags}" if tags else ""
     return (
         f"{cat_emoji} *#{token}*{badge_txt} | {price_str}{rank_txt}{kind_txt}{pa_txt}{note_flag}\n"
-        f"{tags}\n"
+        f"{tags_line}\n"
         f"{score}/100 | {category} | {action} | ریسک: {risk}"
     )
 
@@ -209,8 +209,9 @@ def format_full(result: dict) -> str:
         lines.append(f"🏷 *ریسک BITFA:* {bitfa_risk}")
     lines += ["", f"📊 *امتیاز:* {score}/100", f"🏷 *دسته:* {category}", f"⚡ *اقدام:* {action}",
               f"⚠️ *ریسک:* {risk}", f"🎯 *اعتماد:* {conf}%", f"💰 *پیشنهاد حجم:* {pos}"]
-    if pa_score is not None:
-        tag_str = ", ".join(pa_tags) if pa_tags else "-"
+    meaningful = [t for t in (pa_tags or []) if t not in ("LowActivity", "Neutral", "-")]
+    if pa_score is not None and (int(pa_score or 0) > 0 or meaningful):
+        tag_str = ", ".join(meaningful or pa_tags) if (meaningful or pa_tags) else "-"
         lines.append(f"📐 *Price Action:* {pa_score}/20 | {tag_str}")
     lines += ["", f"📝 *توصیه:*\n{rec}"]
     if analyst_note:
@@ -230,42 +231,36 @@ def format_full(result: dict) -> str:
     if metrics:
         lines.append("\n📈 *متریک‌ها:*")
         if metrics.get("liquidity_usd"):
-            lines.append(f"• لیکوئیدیتی دکس: ${metrics['liquidity_usd']:,.0f}")
+            lines.append(f"• لیکوئیدیتی دکس: ${metrics['liquidity_usd']:,}")
         if metrics.get("volume_24h"):
-            lines.append(f"• حجم (تقریبی): ${metrics['volume_24h']:,.0f}")
+            lines.append(f"• حجم (تقریبی): ${metrics['volume_24h']:,}")
         if metrics.get("market_cap"):
-            lines.append(f"• مارکت‌کپ: ${metrics['market_cap']:,.0f}")
+            lines.append(f"• مارکت‌کپ: ${metrics['market_cap']:,}")
         if metrics.get("price_change_24h") is not None:
             lines.append(f"• تغییر ۲۴س: {metrics['price_change_24h']}%")
         if metrics.get("chain"):
             lines.append(f"• زنجیره دکس: {metrics['chain']}")
-    if links.get("coingecko") or links.get("dexscreener"):
+    link_parts = []
+    if links.get("coingecko"):
+        link_parts.append(f"• CoinGecko: {links['coingecko']}")
+    if links.get("dexscreener"):
+        link_parts.append(f"• DexScreener: {links['dexscreener']}")
+    if link_parts:
         lines.append("\n🔗 *لینک بررسی:*")
-        if links.get("coingecko"):
-            lines.append(f"• CoinGecko: {links['coingecko']}")
-        if links.get("dexscreener"):
-            lines.append(f"• DexScreener: {links['dexscreener']}")
+        lines.extend(link_parts)
     lines.append("\n_NFA | DYOR_")
     return "\n".join(lines)
 
 
 def format_scan(data: dict) -> str:
-    if data.get("error"):
-        return f"❌ خطا در اسکن کانال:\n{data.get('error')}"
     if data.get("note") and not (data.get("results") or []):
         return f"📡 اسکن انجام شد.\n{data.get('note')}\nپیام: {data.get('messages_checked', 0)} | PDF: {data.get('pdfs_parsed', 0)}"
-    lines = ["📡 *اسکن کانال BITFA*", f"پیام: {data.get('messages_checked', 0)} | PDF: {data.get('pdfs_parsed', 0)} | تیکر: {len(data.get('tickers_found') or [])}", ""]
-    diff = data.get("diff") or {}
-    if diff.get("new") or diff.get("improved") or diff.get("dropped"):
-        lines.append("🧠 *تغییر نسبت به اسکن قبل:*")
-        if diff.get("new"):
-            lines.append("🆕 جدید: " + ", ".join(f"#{x}" for x in diff["new"][:8]))
-        if diff.get("improved"):
-            lines.append("📈 بهبود امتیاز: " + ", ".join(f"#{x}" for x in diff["improved"][:8]))
-        if diff.get("dropped"):
-            lines.append("📉 خارج‌شده از لیست خوب: " + ", ".join(f"#{x}" for x in diff["dropped"][:6]))
-        lines.append("")
     summary = data.get("summary") or {}
+    lines = [
+        "📡 *اسکن کانال BITFA*",
+        f"پیام: {data.get('messages_checked', 0)} | PDF: {data.get('pdfs_parsed', 0)} | تیکر: {len(data.get('tickers_found') or [])}",
+        "",
+    ]
     if summary.get("HOT"):
         lines.append("🔥 *HOT:* " + ", ".join(summary["HOT"]))
     if summary.get("QUALIFIED"):
@@ -273,59 +268,85 @@ def format_scan(data: dict) -> str:
     if summary.get("WATCH"):
         lines.append("👀 *WATCH:* " + ", ".join(summary["WATCH"]))
     if summary.get("SKIP"):
-        skip_show = summary["SKIP"][:5]
-        extra = len(summary["SKIP"]) - len(skip_show)
-        skip_line = ", ".join(skip_show)
-        if extra > 0:
-            skip_line += f" …(+{extra})"
-        lines.append("❌ *SKIP:* " + skip_line)
+        lines.append("❌ *SKIP:* " + ", ".join(summary["SKIP"][:6]))
+    lines.append("")
+    diff = data.get("diff") or {}
+    if any(diff.get(k) for k in ("new", "improved", "declined", "upgraded", "dropped")):
+        lines.append("────────────")
+        if diff.get("new"):
+            lines.append("🆕 جدید: " + ", ".join(f"#{x}" for x in diff["new"][:8]))
+        if diff.get("upgraded"):
+            lines.append("🚀 ارتقای دسته: " + ", ".join(f"#{x}" for x in diff["upgraded"][:8]))
+        if diff.get("improved"):
+            lines.append("📈 بهبود امتیاز: " + ", ".join(f"#{x}" for x in diff["improved"][:8]))
+        if diff.get("declined"):
+            lines.append("📉 افت امتیاز: " + ", ".join(f"#{x}" for x in diff["declined"][:8]))
+        if diff.get("dropped"):
+            lines.append("🗑 خارج‌شده از لیست خوب: " + ", ".join(f"#{x}" for x in diff["dropped"][:6]))
+        lines.append("")
+    lines.append("────────────")
+    lines.append("کریپتو (مرتب‌شده):\n")
     new_set = set(diff.get("new") or [])
     improved_set = set(diff.get("improved") or [])
-    crypto_rows, stock_rows = [], []
+    upgraded_set = set(diff.get("upgraded") or [])
+    deltas = diff.get("deltas") or {}
+    crypto_lines = []
+    stock_lines = []
     for item in (data.get("results") or []):
         r = item.get("result") or {}
+        t = (r.get("token") or item.get("ticker") or "").upper()
+        badges = []
+        if t in new_set:
+            badges.append("🆕")
+        if t in upgraded_set:
+            badges.append("🚀")
+        if t in improved_set:
+            badges.append("📈")
+        dlt = deltas.get(t)
+        if dlt is not None and dlt != 0:
+            badges.append(f"{'+' if dlt > 0 else ''}{dlt}")
+        badge = " ".join(badges)
+        line = format_single(item.get("ticker"), r, badge=badge)
+        note = (r.get("analyst_note") or "")
+        if note and r.get("category") in ("HOT", "QUALIFIED"):
+            line += f"\n📝 {note[:160]}{'…' if len(note) > 160 else ''}"
         if str(r.get("asset_kind") or "").startswith("stock"):
-            stock_rows.append(item)
+            stock_lines.append(line)
         else:
-            crypto_rows.append(item)
-    if crypto_rows:
-        lines.append("\n────────────\n*کریپتو (مرتب‌شده):*\n")
-        for item in crypto_rows:
-            t = (item.get("result") or {}).get("token") or item.get("ticker") or ""
-            badge = "🆕" if t.upper() in new_set else ("📈" if t.upper() in improved_set else "")
-            lines.append(format_single(item.get("ticker"), item.get("result") or {}, badge=badge))
-            note = (item.get("result") or {}).get("analyst_note")
-            if note:
-                short = note[:160] + ("…" if len(note) > 160 else "")
-                lines.append(f"📝 {short}")
-            lines.append("")
-    if stock_rows:
-        lines.append("────────────\n*🏛 سهام / پرپ (جدا از آلت):*\n")
-        for item in stock_rows:
-            lines.append(format_single(item.get("ticker"), item.get("result") or {}))
-            lines.append("")
-    lines.append("_اولویت با PDF واچ‌لیست_\n_دستور: /scan_\n_NFA | DYOR_")
+            crypto_lines.append(line)
+    lines.extend(crypto_lines)
+    if stock_lines:
+        lines.append("\n────────────\n🏛 سهام / پرپ (جدا از آلت):\n")
+        lines.extend(stock_lines)
+    lines.append("\nاولویت با PDF واچ‌لیست\nدستور: /scan\n_NFA | DYOR_")
     return "\n".join(lines)
 
 
 def format_daily_report(data: dict) -> str:
-    if data.get("error"):
-        return f"❌ اسکن روزانه ناموفق:\n{data.get('error')}"
     lines = ["☀️ *گزارش روزانه BITFA*", ""]
-    diff = data.get("diff") or {}
     summary = data.get("summary") or {}
+    diff = data.get("diff") or {}
+    deltas = diff.get("deltas") or {}
     hot = summary.get("HOT") or []
     qual = summary.get("QUALIFIED") or []
     if not hot and not qual:
         lines.append("امروز مورد HOT/QUALIFIED پیدا نشد.")
         if diff.get("dropped"):
             lines.append("📉 خارج‌شده: " + ", ".join(f"#{x}" for x in diff["dropped"][:6]))
-        lines.append("\n_NFA | DYOR_")
+        if diff.get("declined"):
+            lines.append("📉 افت امتیاز: " + ", ".join(f"#{x}" for x in diff["declined"][:6]))
+        lines.append("\n_گزارش خودکار روزانه_\n_NFA | DYOR_")
         return "\n".join(lines)
     if diff.get("new"):
         lines.append("🆕 *جدید در لیست:* " + ", ".join(f"#{x}" for x in diff["new"][:8]))
+    if diff.get("upgraded"):
+        lines.append("🚀 *ارتقای دسته:* " + ", ".join(f"#{x}" for x in diff["upgraded"][:8]))
     if diff.get("improved"):
         lines.append("📈 *بهبود امتیاز:* " + ", ".join(f"#{x}" for x in diff["improved"][:8]))
+    if diff.get("declined"):
+        lines.append("📉 *افت امتیاز:* " + ", ".join(f"#{x}" for x in diff["declined"][:8]))
+    if diff.get("dropped"):
+        lines.append("🗑 *خارج‌شده از لیست خوب:* " + ", ".join(f"#{x}" for x in diff["dropped"][:6]))
     if hot:
         lines.append("🔥 *HOT:* " + ", ".join(hot))
     if qual:
@@ -333,16 +354,30 @@ def format_daily_report(data: dict) -> str:
     lines.append("")
     new_set = set(diff.get("new") or [])
     improved_set = set(diff.get("improved") or [])
+    upgraded_set = set(diff.get("upgraded") or [])
     for item in (data.get("results") or []):
         r = item.get("result") or {}
         if r.get("category") not in ("HOT", "QUALIFIED"):
             continue
         t = (r.get("token") or item.get("ticker") or "").upper()
-        badge = "🆕" if t in new_set else ("📈" if t in improved_set else "")
+        badges = []
+        if t in new_set:
+            badges.append("🆕")
+        if t in upgraded_set:
+            badges.append("🚀")
+        if t in improved_set:
+            badges.append("📈")
+        dlt = deltas.get(t)
+        if dlt is None:
+            dlt = deltas.get((item.get("ticker") or "").upper())
+        if dlt is not None and dlt != 0:
+            badges.append(f"{'+' if dlt > 0 else ''}{dlt}")
+        badge = " ".join(badges)
         lines.append(format_single(item.get("ticker"), r, badge=badge))
         note = r.get("analyst_note")
         if note:
-            lines.append(f"📝 {note[:180]}{'…' if len(note) > 180 else ''}")
+            short = note[:200] + ("…" if len(note) > 200 else "")
+            lines.append(f"📝 *یادداشت تحلیلگر:* {short}")
         lines.append("")
     lines.append("_گزارش خودکار روزانه_\n_NFA | DYOR_")
     return "\n".join(lines)
@@ -369,7 +404,34 @@ def score_ticker_list(tickers: List[str], notes_map: Optional[Dict[str, Any]] = 
         results.append({"ticker": t, "result": r})
     focus = [x for x in results if x["result"].get("category") in ("HOT", "QUALIFIED", "WATCH")]
     skips = [x for x in results if x["result"].get("category") == "SKIP"][:4]
-    return {"messages_checked": 0, "pdfs_parsed": 1, "tickers_found": tickers, "summary": summary, "results": focus + skips, "diff": {"new": [], "improved": [], "dropped": [], "unchanged_hot": []}}
+    current_map = {}
+    for item in results:
+        r = item.get("result") or {}
+        tok = (r.get("token") or item.get("ticker") or "").upper()
+        if not tok:
+            continue
+        current_map[tok] = {
+            "score": int(r.get("score") or 0),
+            "category": r.get("category") or "SKIP",
+            "token": tok,
+            "pa_score": r.get("pa_score"),
+        }
+    try:
+        from storage import load_last_scan, save_last_scan, diff_with_previous
+        prev = load_last_scan()
+        diff = diff_with_previous(current_map, prev)
+        save_last_scan(current_map)
+    except Exception as e:
+        logger.error(f"diff/persist error: {e}")
+        diff = {"new": [], "improved": [], "declined": [], "upgraded": [], "dropped": [], "unchanged_hot": [], "deltas": {}}
+    return {
+        "messages_checked": 0,
+        "pdfs_parsed": 1,
+        "tickers_found": tickers,
+        "summary": summary,
+        "results": focus + skips,
+        "diff": diff,
+    }
 
 
 def send_telegram_message(chat_id: int, text: str):
@@ -420,12 +482,12 @@ def run_scan_job_thread(chat_id: int, daily: bool = False):
 
 @app.get("/")
 def root():
-    return {"status": "ok", "version": "1.6.1", "message": "BITFA Scorer - search tags", "bot": "enabled" if BOT_TOKEN else "disabled", "cron": "/cron/daily-scan?key=CRON_SECRET&chat_id=YOUR_CHAT_ID"}
+    return {"status": "ok", "version": "1.7.0", "message": "BITFA Scorer - score delta + notes", "bot": "enabled" if BOT_TOKEN else "disabled", "cron": "/cron/daily-scan?key=CRON_SECRET&chat_id=YOUR_CHAT_ID"}
 
 
 @app.get("/health")
 def health():
-    return {"status": "healthy", "version": "1.6.1"}
+    return {"status": "healthy", "version": "1.7.0"}
 
 
 @app.get("/cron/daily-scan")
@@ -453,24 +515,18 @@ def analyze(req: AnalyzeRequest):
 
 @app.post("/telegram-webhook")
 async def telegram_webhook(request: Request):
-    if not BOT_TOKEN:
-        return Response(status_code=200)
     try:
-        data = await request.json()
+        body = await request.json()
     except Exception:
         return Response(status_code=200)
-    update_id = data.get("update_id")
+    update_id = body.get("update_id")
     if update_id is not None:
         if update_id in _processed_updates:
             return Response(status_code=200)
         _processed_updates.add(update_id)
         if len(_processed_updates) > _processed_max:
-            for _ in range(100):
-                try:
-                    _processed_updates.pop()
-                except KeyError:
-                    break
-    message = data.get("message") or data.get("edited_message")
+            _processed_updates.clear()
+    message = body.get("message") or body.get("edited_message")
     if not message:
         return Response(status_code=200)
     chat_id = message["chat"]["id"]
@@ -503,7 +559,7 @@ async def telegram_webhook(request: Request):
     if not text:
         return Response(status_code=200)
     if text.startswith("/start"):
-        send_telegram_message(chat_id, "سلام 👋\nربات BITFA + PA + یادداشت + تگ سرچ\n\n• تیکر / آدرس / PDF بفرست\n• /scan اسکن کانال")
+        send_telegram_message(chat_id, "سلام 👋\nربات BITFA + PA + یادداشت + تگ سرچ + delta\n\n• تیکر / آدرس / PDF بفرست\n• /scan اسکن کانال")
         return Response(status_code=200)
     if text.startswith("/help"):
         send_telegram_message(chat_id, "دستورات:\n/scan — اسکن کانال\nتیکر/آدرس/PDF را مستقیم بفرست.")
