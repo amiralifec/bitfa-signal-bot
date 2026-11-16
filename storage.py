@@ -1,5 +1,5 @@
 """
-حافظه اسکن قبلی + کش قرارداد/جفت + کول‌داون دامپ
+حافظه اسکن قبلی + کش قرارداد/جفت + کول‌داون دامپ + streak + رژیم BTC
 پایداری اختیاری روی GitHub Gist
 
 Env:
@@ -29,6 +29,7 @@ DUMP_COOLDOWN_HOURS = float(os.getenv("DUMP_COOLDOWN_HOURS") or "6")
 CAT_RANK = {"SKIP": 0, "WATCH": 1, "QUALIFIED": 2, "HOT": 3}
 
 _gist_loaded = False
+_btc_cache: Dict[str, Any] = {"ts": 0.0, "change_24h": None, "price": None}
 
 
 def _now_iso() -> str:
@@ -180,9 +181,29 @@ def load_last_scan() -> Dict[str, Any]:
 
 
 def save_last_scan(ticker_scores: Dict[str, Dict[str, Any]]) -> None:
+    prev = _read_local(STORE_PATH, {"tickers": {}, "updated_at": None})
+    prev_t = (prev or {}).get("tickers") or {}
+    enriched: Dict[str, Dict[str, Any]] = {}
+    for t, info in (ticker_scores or {}).items():
+        row = dict(info or {})
+        score = int(row.get("score") or 0)
+        old = prev_t.get(t) or prev_t.get(str(t).upper()) or {}
+        old_score = int(old.get("score") or 0)
+        old_streak = int(old.get("streak") or 0)
+        if old and score - old_score >= 5:
+            streak = (old_streak + 1) if old_streak > 0 else 1
+        elif old and old_score - score >= 5:
+            streak = (old_streak - 1) if old_streak < 0 else -1
+        elif old:
+            streak = 0
+        else:
+            streak = 0
+        row["streak"] = streak
+        row["prev_score"] = old_score if old else None
+        enriched[t] = row
     payload = {
         "updated_at": _now_iso(),
-        "tickers": ticker_scores,
+        "tickers": enriched,
     }
     _write_local(STORE_PATH, payload)
     _sync_out()
@@ -244,7 +265,6 @@ def mark_dump_cooldown(
     reason: str = "severe_dump",
     hours: Optional[float] = None,
 ) -> None:
-    """ثبت کول‌داون بعد از دامپ/فاز نزولی."""
     if not ticker:
         return
     key = ticker.strip().upper()
@@ -258,7 +278,6 @@ def mark_dump_cooldown(
     items = data.get("items") or {}
     prev = items.get(key) or {}
     prev_until = _parse_iso(prev.get("until") or "")
-    # اگر کول‌داون قبلی طولانی‌تر است، کوتاه نکن
     if prev_until and prev_until > until:
         until = prev_until
     items[key] = {
@@ -311,12 +330,6 @@ def clear_dump_cooldown(ticker: str) -> None:
 
 
 def apply_dump_cooldown_guard(result: dict) -> dict:
-    """
-    اگر تیکر در کول‌داون دامپ باشد:
-      - سقف دسته = WATCH
-      - سقف امتیاز = ۵۸
-    مگر تأیید تازه: فاز EARLY/DEVELOPING + بوست پامپ مثبت + بدون severe_dump این اسکن.
-    """
     if not result or result.get("error"):
         return result
     token = (result.get("token") or "").upper()
@@ -327,7 +340,6 @@ def apply_dump_cooldown_guard(result: dict) -> dict:
     pump_sum = result.get("pump_summary") or {}
     severe_now = bool(pump_sum.get("severe_dump"))
 
-    # ثبت کول‌داون تازه
     if severe_now or phase in ("BEARISH", "EXHAUSTED"):
         reason = "severe_dump" if severe_now else f"phase_{phase.lower()}"
         try:
@@ -339,7 +351,6 @@ def apply_dump_cooldown_guard(result: dict) -> dict:
     if not cd:
         return result
 
-    # تأیید خروج از کول‌داون
     pump_boost = int(result.get("pump_boost") or 0)
     confirmed = (
         phase in ("EARLY", "DEVELOPING")
@@ -359,7 +370,6 @@ def apply_dump_cooldown_guard(result: dict) -> dict:
         r["dump_cooldown_cleared"] = True
         return r
 
-    # اعمال سقف
     r = dict(result)
     score = int(r.get("score") or 0)
     cat = r.get("category") or "SKIP"
@@ -372,14 +382,159 @@ def apply_dump_cooldown_guard(result: dict) -> dict:
         warnings = list(r.get("warnings") or [])
         rem = cd.get("remaining_hours")
         reason = cd.get("reason") or "dump"
-        warnings.insert(
-            0,
-            f"کول‌داون دامپ ({reason}) ~{rem}س مانده — QUALIFIED مسدود",
-        )
+        warnings.insert(0, f"کول‌داون دامپ ({reason}) ~{rem}س مانده — QUALIFIED مسدود")
         r["warnings"] = warnings[:8]
         r["dump_cooldown"] = cd
     else:
         r["dump_cooldown"] = cd
+    return r
+
+
+def get_btc_regime() -> Dict[str, Any]:
+    import time
+    now = time.time()
+    if _btc_cache.get("ts") and now - float(_btc_cache["ts"]) < 600 and _btc_cache.get("change_24h") is not None:
+        return {
+            "change_24h": _btc_cache["change_24h"],
+            "price": _btc_cache.get("price"),
+            "regime": _btc_cache.get("regime") or "neutral",
+            "cached": True,
+        }
+    ch = None
+    price = None
+    try:
+        if requests is not None:
+            r = requests.get(
+                "https://api.coingecko.com/api/v3/simple/price",
+                params={"ids": "bitcoin", "vs_currencies": "usd", "include_24hr_change": "true"},
+                timeout=10,
+            )
+            if r.status_code == 200:
+                node = (r.json() or {}).get("bitcoin") or {}
+                ch = node.get("usd_24h_change")
+                price = node.get("usd")
+                if ch is not None:
+                    ch = float(ch)
+                if price is not None:
+                    price = float(price)
+    except Exception as e:
+        print(f"btc regime fetch: {e}")
+    if ch is None:
+        return {"change_24h": None, "price": None, "regime": "unknown", "cached": False}
+    if ch <= -3.0:
+        regime = "risk_off"
+    elif ch >= 3.0:
+        regime = "risk_on"
+    else:
+        regime = "neutral"
+    _btc_cache["ts"] = now
+    _btc_cache["change_24h"] = ch
+    _btc_cache["price"] = price
+    _btc_cache["regime"] = regime
+    return {"change_24h": ch, "price": price, "regime": regime, "cached": False}
+
+
+def apply_btc_regime_guard(result: dict, btc: Optional[Dict[str, Any]] = None) -> dict:
+    if not result or result.get("error"):
+        return result
+    kind = str(result.get("asset_kind") or "crypto")
+    if kind.startswith("stock"):
+        return result
+    if btc is None:
+        btc = get_btc_regime()
+    ch = btc.get("change_24h")
+    regime = btc.get("regime") or "unknown"
+    if ch is None or regime != "risk_off":
+        r = dict(result)
+        r["btc_regime"] = regime
+        r["btc_change_24h"] = ch
+        return r
+
+    r = dict(result)
+    r["btc_regime"] = regime
+    r["btc_change_24h"] = ch
+    phase = (r.get("entry_phase") or "").upper()
+    if phase == "DEVELOPING" and int(r.get("pump_boost") or 0) >= 4:
+        warnings = list(r.get("warnings") or [])
+        warnings.append(f"BTC {ch:.1f}% (risk-off) ولی DEVELOPING قوی — فیلتر نرم")
+        r["warnings"] = warnings[:8]
+        return r
+
+    score = int(r.get("score") or 0)
+    cat = r.get("category") or "SKIP"
+    changed = False
+    if cat == "HOT":
+        score = min(score, 74)
+        cat = "QUALIFIED"
+        r["recommendation"] = "رژیم BTC منفی — از HOT به QUALIFIED محدود شد"
+        r["action"] = "بررسی برای ورود"
+        changed = True
+    elif cat == "QUALIFIED":
+        score = min(score, 58)
+        cat = "WATCH"
+        r["recommendation"] = "رژیم BTC منفی (risk-off) — فقط نظارت"
+        r["action"] = "نظارت"
+        changed = True
+    if changed:
+        r["score"] = score
+        r["category"] = cat
+        warnings = list(r.get("warnings") or [])
+        warnings.insert(0, f"رژیم BTC: risk-off ({ch:.1f}% در ۲۴س) — سقف دسته محدود شد")
+        r["warnings"] = warnings[:8]
+    return r
+
+
+def apply_streak_boost(result: dict, previous_scan: Optional[Dict[str, Any]] = None) -> dict:
+    if not result or result.get("error"):
+        return result
+    token = (result.get("token") or "").upper()
+    if not token:
+        return result
+    prev_full = previous_scan if previous_scan is not None else load_last_scan()
+    prev = (prev_full or {}).get("tickers") or {}
+    old = prev.get(token) or {}
+    old_streak = int(old.get("streak") or 0)
+    old_score = int(old.get("score") or 0)
+    cur_score = int(result.get("score") or 0)
+
+    if old:
+        if cur_score - old_score >= 5:
+            streak = (old_streak + 1) if old_streak > 0 else 1
+        elif old_score - cur_score >= 5:
+            streak = (old_streak - 1) if old_streak < 0 else -1
+        else:
+            streak = 0
+    else:
+        streak = 0
+
+    r = dict(result)
+    r["streak"] = streak
+    if streak >= 2:
+        new_score = min(100, cur_score + 3)
+        r["score"] = new_score
+        reasons = list(r.get("reasons") or [])
+        reasons.insert(0, f"بهبود متوالی {streak} اسکن (MomentumConfirmed)")
+        r["reasons"] = reasons[:10]
+        conf = int(r.get("confidence") or 0)
+        r["confidence"] = min(100, conf + 5)
+        if new_score >= 80 and int(r.get("confidence") or 0) >= 70:
+            r["category"], r["recommendation"], r["action"] = "HOT", "امتیاز عالی - قابل بررسی جدی برای ورود محدود", "اولویت بررسی"
+        elif new_score >= 65:
+            r["category"], r["recommendation"], r["action"] = "QUALIFIED", "امتیاز خوب - مناسب بررسی با مدیریت ریسک سخت", "بررسی برای ورود"
+        elif new_score >= 48:
+            r["category"], r["recommendation"], r["action"] = "WATCH", "امتیاز متوسط - فقط نظارت و انتظار تأیید ساختار", "نظارت"
+    elif streak <= -2:
+        new_score = max(0, cur_score - 3)
+        r["score"] = new_score
+        warnings = list(r.get("warnings") or [])
+        warnings.insert(0, f"افت متوالی {abs(streak)} اسکن")
+        r["warnings"] = warnings[:8]
+        if new_score >= 65:
+            r["category"], r["recommendation"], r["action"] = "QUALIFIED", "امتیاز خوب - مناسب بررسی با مدیریت ریسک سخت", "بررسی برای ورود"
+        elif new_score >= 48:
+            r["category"], r["recommendation"], r["action"] = "WATCH", "امتیاز متوسط - فقط نظارت و انتظار تأیید ساختار", "نظارت"
+        else:
+            r["category"], r["recommendation"], r["action"] = "SKIP", "امتیاز ضعیف - رد شود", "رد"
     return r
 
 
