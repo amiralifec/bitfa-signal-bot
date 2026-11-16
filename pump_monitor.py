@@ -1,27 +1,21 @@
 """
-مانیتور کانال binance_futures_5m_pump
-فقط سیگنال‌های UP + حجم بالا، بعد فیلتر فاز ورود BITFA
+لایه مومنتوم از @binance_futures_5m_pump
+برای هر تیکر واچ‌لیست BITFA، پیام‌های اخیر همان نماد را جمع می‌کند
+و روی امتیاز نهایی بوست/جریمه می‌گذارد (نه دستور جدا).
 """
 
 import os
 import re
 import asyncio
-from typing import List, Dict, Any, Optional
+from datetime import datetime, timezone, timedelta
+from typing import List, Dict, Any, Optional, Tuple
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-
-from scorer import analyze_token
 
 API_ID = int(os.getenv("TELEGRAM_API_ID") or os.getenv("API_ID") or "0")
 API_HASH = os.getenv("TELEGRAM_API_HASH") or os.getenv("API_HASH") or ""
 SESSION = os.getenv("TELEGRAM_SESSION") or ""
 PUMP_CHANNEL = os.getenv("PUMP_CHANNEL") or "binance_futures_5m_pump"
-
-# آستانه‌ها
-MIN_VOL_UP_PCT = float(os.getenv("PUMP_MIN_VOL_PCT") or "120")
-MIN_PRICE_UP_PCT = float(os.getenv("PUMP_MIN_PRICE_PCT") or "2.0")
-MAX_24H_CHANGE = float(os.getenv("PUMP_MAX_24H") or "55")  # بالاتر = احتمال chase
-ALLOWED_PHASES = {"EARLY", "DEVELOPING"}
 
 MSG_RE = re.compile(
     r"#\s*([A-Za-z][A-Za-z0-9]{1,20})\s*(?:USDT)?\s*"
@@ -77,68 +71,51 @@ def parse_pump_message(text: str) -> Optional[Dict[str, Any]]:
         "price": price,
         "change_24h": ch24,
         "volume_24h": vol24,
-        "raw": text[:300],
     }
 
 
-def _passes_raw_filter(p: Dict[str, Any]) -> bool:
-    if p.get("direction") != "UP":
-        return False
-    if float(p.get("vol_up_pct") or 0) < MIN_VOL_UP_PCT:
-        return False
-    if float(p.get("move_pct") or 0) < MIN_PRICE_UP_PCT:
-        return False
-    ch24 = p.get("change_24h")
-    if ch24 is not None and float(ch24) > MAX_24H_CHANGE:
-        # هنوز می‌تونه DEVELOPING باشه؛ سخت رد نکن — فقط علامت بزن
-        p["late_risk"] = True
-    return True
-
-
-async def fetch_recent_pumps(limit_messages: int = 40) -> Dict[str, Any]:
+async def fetch_pump_index(limit_messages: int = 80, hours: int = 24) -> Dict[str, Any]:
+    """
+    همه پیام‌های قابل‌پارس ~۲۴ساعت اخیر را به صورت
+    {TICKER: [events newest-first]} برمی‌گرداند.
+    """
     if not SESSION or not API_ID or not API_HASH:
-        return {"error": "TELEGRAM_SESSION / API_ID / API_HASH تنظیم نشده", "alerts": []}
+        return {"error": "session missing", "index": {}, "messages_checked": 0}
 
     client = TelegramClient(
         StringSession(SESSION),
         API_ID,
         API_HASH,
-        connection_retries=3,
-        request_retries=3,
+        connection_retries=2,
+        request_retries=2,
         retry_delay=1,
-        timeout=20,
+        timeout=18,
     )
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    index: Dict[str, List[Dict[str, Any]]] = {}
+    checked = 0
     try:
-        await asyncio.wait_for(client.connect(), timeout=30)
-        if not await asyncio.wait_for(client.is_user_authorized(), timeout=15):
-            return {"error": "سشن تلگرام authorize نیست", "alerts": []}
-
+        await asyncio.wait_for(client.connect(), timeout=25)
+        if not await asyncio.wait_for(client.is_user_authorized(), timeout=12):
+            return {"error": "not authorized", "index": {}, "messages_checked": 0}
         entity = await client.get_entity(PUMP_CHANNEL)
-        parsed: List[Dict[str, Any]] = []
-        seen = set()
-        checked = 0
         async for msg in client.iter_messages(entity, limit=limit_messages):
             checked += 1
-            text = msg.message or ""
-            p = parse_pump_message(text)
-            if not p or not _passes_raw_filter(p):
-                continue
-            key = p["ticker"]
-            if key in seen:
-                continue
-            seen.add(key)
-            p["msg_date"] = msg.date.isoformat() if msg.date else None
-            parsed.append(p)
-            if len(parsed) >= 12:
+            if msg.date and msg.date.replace(tzinfo=timezone.utc) < cutoff:
                 break
-
+            p = parse_pump_message(msg.message or "")
+            if not p:
+                continue
+            p["msg_date"] = msg.date.isoformat() if msg.date else None
+            index.setdefault(p["ticker"], []).append(p)
         return {
             "channel": PUMP_CHANNEL,
             "messages_checked": checked,
-            "candidates": parsed,
+            "index": index,
+            "tickers": list(index.keys()),
         }
     except Exception as e:
-        return {"error": str(e)[:300], "alerts": []}
+        return {"error": str(e)[:250], "index": {}, "messages_checked": checked}
     finally:
         try:
             await client.disconnect()
@@ -146,116 +123,151 @@ async def fetch_recent_pumps(limit_messages: int = 40) -> Dict[str, Any]:
             pass
 
 
-def score_pump_candidates(candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """روی هر کاندید analyze_token بزن و فقط فاز EARLY/DEVELOPING را نگه دار."""
-    kept = []
-    skipped = []
-    for p in candidates[:10]:
-        ticker = p["ticker"]
-        try:
-            r = analyze_token(symbol=ticker)
-            if r.get("error"):
-                skipped.append({"ticker": ticker, "reason": r.get("error"), "pump": p})
-                continue
-            phase = (r.get("entry_phase") or "NEUTRAL").upper()
-            score = int(r.get("score") or 0)
-            ch24 = r.get("metrics", {}).get("price_change_24h")
-            if ch24 is None:
-                ch24 = p.get("change_24h")
+def evaluate_pump_for_ticker(
+    ticker: str,
+    index: Dict[str, List[Dict[str, Any]]],
+    *,
+    entry_phase: str = "",
+) -> Dict[str, Any]:
+    """
+    برای یک نماد از روی ایندکس پامپ، بوست امتیاز و خلاصه برمی‌گرداند.
 
-            reject = None
-            if phase not in ALLOWED_PHASES and phase not in ("", "NEUTRAL"):
-                # NEUTRAL با امتیاز خوب هنوز قابل‌بررسی است اگر vol خیلی بالا باشد
-                if phase in ("EXHAUSTED", "EXTENDED", "BEARISH"):
-                    reject = f"فاز {phase}"
-            if phase == "EXHAUSTED":
-                reject = "EXHAUSTED / chase"
-            if ch24 is not None and float(ch24) > 90:
-                reject = f"رشد ۲۴س بیش از حد ({ch24}%)"
-            if score < 45 and phase not in ALLOWED_PHASES:
-                reject = f"امتیاز پایین ({score})"
+    منطق (نسخه EVAA):
+    - چند UP با حجم بالا در شروع موج → بوست مثبت
+    - آخرین‌ها DOWN یا رشد ۲۴س خیلی بالا بعد از موج → جریمه / بدون بوست
+    """
+    t = (ticker or "").upper().strip()
+    if t.endswith("USDT"):
+        t = t[:-4]
+    events = list(index.get(t) or [])
+    if not events:
+        return {"boost": 0, "summary": None, "events": 0}
 
-            item = {
-                "ticker": ticker,
-                "pump": p,
-                "result": r,
-                "phase": phase,
-                "score": score,
-            }
-            if reject:
-                item["reject"] = reject
-                skipped.append(item)
-            else:
-                kept.append(item)
-        except Exception as e:
-            skipped.append({"ticker": ticker, "reason": str(e)[:120], "pump": p})
+    ups = [e for e in events if e.get("direction") == "UP"]
+    downs = [e for e in events if e.get("direction") == "DOWN"]
+    latest = events[0]
+    max_vol = max((float(e.get("vol_up_pct") or 0) for e in events), default=0)
+    max_up_move = max((float(e.get("move_pct") or 0) for e in ups), default=0) if ups else 0
+    ch24s = [float(e["change_24h"]) for e in events if e.get("change_24h") is not None]
+    max_ch24 = max(ch24s) if ch24s else None
+    min_ch24 = min(ch24s) if ch24s else None
+    prices = [float(e["price"]) for e in events if e.get("price") is not None]
+    price_first = prices[-1] if prices else None  # oldest in list order newest-first
+    price_last = prices[0] if prices else None
 
-    kept.sort(key=lambda x: x.get("score") or 0, reverse=True)
-    return {"kept": kept, "skipped": skipped}
+    boost = 0
+    notes = []
 
+    # جریمه اگر آخرین سیگنال DOWN با حجم باشد
+    if latest.get("direction") == "DOWN" and float(latest.get("vol_up_pct") or 0) >= 100:
+        boost -= 4
+        notes.append(f"آخرین هشدار پامپ: DOWN ({latest.get('move_pct')}%)")
+    elif latest.get("direction") == "UP" and float(latest.get("vol_up_pct") or 0) >= 150:
+        boost += 3
+        notes.append(f"هشدار پامپ اخیر: UP +{latest.get('move_pct')}% / Vol+{latest.get('vol_up_pct')}%")
 
-async def scan_pumps(limit_messages: int = 40) -> Dict[str, Any]:
-    meta = await fetch_recent_pumps(limit_messages=limit_messages)
-    if meta.get("error"):
-        return meta
-    scored = score_pump_candidates(meta.get("candidates") or [])
-    return {
-        "channel": meta.get("channel"),
-        "messages_checked": meta.get("messages_checked", 0),
-        "candidates_raw": len(meta.get("candidates") or []),
-        "kept": scored["kept"],
-        "skipped": scored["skipped"],
+    # تعداد UPهای قوی در ۲۴س
+    strong_ups = [e for e in ups if float(e.get("vol_up_pct") or 0) >= 150 and float(e.get("move_pct") or 0) >= 3]
+    if len(strong_ups) >= 3:
+        boost += 4
+        notes.append(f"{len(strong_ups)} سیگنال UP قوی در ۲۴س")
+    elif len(strong_ups) >= 1:
+        boost += 2
+        notes.append(f"{len(strong_ups)} سیگنال UP با حجم")
+
+    if max_vol >= 300:
+        boost += 2
+        notes.append(f"اوج Volume up: +{max_vol:.0f}%")
+
+    # اگر موج خیلی جلو رفته (chase)
+    if max_ch24 is not None and max_ch24 >= 90:
+        boost -= 5
+        notes.append(f"رشد ۲۴س در کانال پامپ تا +{max_ch24:.0f}% (ریسک chase)")
+    elif max_ch24 is not None and max_ch24 >= 55:
+        boost -= 2
+        notes.append(f"رشد ۲۴س بالا در پامپ (+{max_ch24:.0f}%)")
+
+    # هم‌راستایی با فاز ورود سیستم خودمان
+    phase = (entry_phase or "").upper()
+    if phase in ("EARLY", "DEVELOPING") and boost > 0:
+        boost += 2
+        notes.append(f"هم‌راستا با فاز {phase}")
+    if phase in ("EXHAUSTED", "BEARISH") and boost > 0:
+        boost = min(boost, 1)
+        notes.append(f"فاز {phase}: بوست پامپ محدود شد")
+    if phase == "EXHAUSTED":
+        boost = min(boost, 0)
+
+    boost = max(-8, min(10, int(boost)))
+
+    summary = {
+        "ticker": t,
+        "events": len(events),
+        "ups": len(ups),
+        "downs": len(downs),
+        "max_vol_up": max_vol,
+        "max_up_move": max_up_move,
+        "max_change_24h": max_ch24,
+        "price_first": price_first,
+        "price_last": price_last,
+        "latest_direction": latest.get("direction"),
+        "notes": notes,
+        "boost": boost,
     }
+    return {"boost": boost, "summary": summary, "events": len(events)}
 
 
-def format_pump_report(data: Dict[str, Any]) -> str:
-    if data.get("error"):
-        return f"❌ خطا در مانیتور پامپ:\n{data['error']}"
-    lines = [
-        "⚡ *هشدار مومنتوم زودهنگام*",
-        f"منبع: @{data.get('channel') or PUMP_CHANNEL}",
-        f"پیام: {data.get('messages_checked', 0)} | کاندید خام: {data.get('candidates_raw', 0)}",
-        "",
-    ]
-    kept = data.get("kept") or []
-    if not kept:
-        lines.append("مورد قابل‌اتکا با فاز EARLY/DEVELOPING پیدا نشد.")
-        skipped = data.get("skipped") or []
-        if skipped:
-            lines.append("\nردشده‌ها (نمونه):")
-            for s in skipped[:5]:
-                t = s.get("ticker")
-                why = s.get("reject") or s.get("reason") or "-"
-                lines.append(f"• #{t}: {why}")
-        lines.append("\n_فیلتر: UP + حجم بالا + فاز ورود_")
-        lines.append("_NFA | DYOR_")
-        return "\n".join(lines)
-
-    lines.append(f"✅ تاییدشده: {len(kept)}\n")
-    for item in kept[:8]:
-        r = item.get("result") or {}
-        p = item.get("pump") or {}
-        t = item.get("ticker")
-        phase = item.get("phase")
-        score = item.get("score")
-        cat = r.get("category") or "-"
-        price = r.get("price_str") or p.get("price") or "-"
-        vol_up = p.get("vol_up_pct")
-        move = p.get("move_pct")
-        pa = r.get("pa_score")
-        phase_map = {
-            "EARLY": "🌱EARLY",
-            "DEVELOPING": "🟢DEV",
-            "EXTENDED": "🟡EXT",
-            "EXHAUSTED": "🔴EXH",
-            "BEARISH": "⬇️BEAR",
-        }
-        ph = phase_map.get(phase, phase)
-        lines.append(
-            f"*{ph}* #{t} | {price} | {score}/100 {cat}\n"
-            f"پامپ: UP {move}% | Vol+{vol_up}% | PA:{pa}/20\n"
-            f"#{t}   #{t}USDT   ${t}   ${t}USDT\n"
-        )
-    lines.append("_فقط EARLY/DEVELOPING بعد از فیلتر فاز_")
-    lines.append("_NFA | DYOR_")
-    return "\n".join(lines)
+def apply_pump_to_result(r: dict, pump_eval: Dict[str, Any]) -> dict:
+    if not pump_eval or not r or r.get("error"):
+        return r
+    boost = int(pump_eval.get("boost") or 0)
+    summary = pump_eval.get("summary")
+    if not boost and not summary:
+        return r
+    r = dict(r)
+    if summary:
+        r["pump_summary"] = summary
+    if boost:
+        old = int(r.get("score") or 0)
+        new_score = max(0, min(100, old + boost))
+        r["score"] = new_score
+        r["pump_boost"] = boost
+        reasons = list(r.get("reasons") or [])
+        warnings = list(r.get("warnings") or [])
+        if boost > 0:
+            reasons.insert(0, f"مومنتوم کانال پامپ: مثبت (+{boost})")
+        else:
+            warnings.insert(0, f"مومنتوم کانال پامپ: منفی ({boost})")
+        for n in (summary or {}).get("notes") or []:
+            if boost > 0:
+                reasons.append(f"پامپ: {n}")
+            else:
+                warnings.append(f"پامپ: {n}")
+        r["reasons"] = reasons[:10]
+        r["warnings"] = warnings[:8]
+        conf = int(r.get("confidence") or 0)
+        if new_score >= 80 and conf >= 70:
+            r["category"], r["recommendation"], r["action"] = (
+                "HOT",
+                "امتیاز عالی - قابل بررسی جدی برای ورود محدود",
+                "اولویت بررسی",
+            )
+        elif new_score >= 65:
+            r["category"], r["recommendation"], r["action"] = (
+                "QUALIFIED",
+                "امتیاز خوب - مناسب بررسی با مدیریت ریسک سخت",
+                "بررسی برای ورود",
+            )
+        elif new_score >= 48:
+            r["category"], r["recommendation"], r["action"] = (
+                "WATCH",
+                "امتیاز متوسط - فقط نظارت و انتظار تأیید ساختار",
+                "نظارت",
+            )
+        else:
+            r["category"], r["recommendation"], r["action"] = (
+                "SKIP",
+                "امتیاز ضعیف - رد شود",
+                "رد",
+            )
+    return r
