@@ -1,12 +1,9 @@
 """
 لایه رتبه‌بندی رشد/افت ۲۴ساعته + Funding Rate
-پیام‌های شبیه:
-  📈 Top growth in 24 hours:
-  #EVAAUSDT: 60 ⇦ 48 ⇦ 43 (41.9 million)
-  FR (4): 0.02101% ⇦ 0.00500% ⇦ 0.00500%
+کانال پیش‌فرض: @PumpDumpRadar
 
 Env:
-  GROWTH_RANK_CHANNEL  — یوزرنیم کانال (بدون @)
+  GROWTH_RANK_CHANNEL  — اختیاری؛ پیش‌فرض PumpDumpRadar
 """
 
 import os
@@ -20,7 +17,7 @@ from telethon.sessions import StringSession
 API_ID = int(os.getenv("TELEGRAM_API_ID") or os.getenv("API_ID") or "0")
 API_HASH = os.getenv("TELEGRAM_API_HASH") or os.getenv("API_HASH") or ""
 SESSION = os.getenv("TELEGRAM_SESSION") or ""
-RANK_CHANNEL = (os.getenv("GROWTH_RANK_CHANNEL") or "").strip().lstrip("@")
+RANK_CHANNEL = (os.getenv("GROWTH_RANK_CHANNEL") or "PumpDumpRadar").strip().lstrip("@")
 
 LINE_RE = re.compile(
     r"#\s*([A-Za-z][A-Za-z0-9]{1,20})(?:USDT|PERP)?\s*:\s*"
