@@ -13,7 +13,6 @@ except Exception:
     PdfReader = None
 
 STOPWORDS = {
-    # عمومی
     "BITFA", "WATCHLIST", "NFA", "DYOR", "USDT", "USD", "BTC", "ETH",
     "LONG", "SHORT", "BUY", "SELL", "ENTRY", "EXIT", "STOP", "TARGET",
     "SUPPORT", "RESISTANCE", "BREAKOUT", "PULLBACK", "WATCH", "LIST",
@@ -23,28 +22,28 @@ STOPWORDS = {
     "THE", "AND", "FOR", "WITH", "FROM", "THIS", "THAT",
     "SK", "MH", "NAP", "NULL", "TRUE", "FALSE", "AMDUSDT", "PERP",
     "GRANITESHARES", "ADVANCED", "MICRO", "DEVICES",
-    # صرافی‌ها و برندهای تکراری داخل PDF بیتفا
     "OKX", "MEXC", "GATE", "LBANK", "KUCOIN", "BITGET", "TOOBIT",
     "BITUNIX", "XT", "BINGX", "BINANCE", "BYBIT", "BTCC", "ORBIT",
     "TOKCRYPTO", "TOKOCRYPTO", "COINBASE", "KRAKEN",
-    # سرمایه‌گذار / VC / کلمات قالب
     "CMS", "HOLDINGS", "FRAMEWORK", "VENTURES", "GALAXY", "PANTERA",
     "DISTRIBUTED", "GLOBAL", "DEFIANCE", "IOSG", "SEVENX", "YZI",
     "LABS", "PREV", "BINANCE", "CAPITAL",
     "DLMM", "PMM", "TVL", "APR", "APY", "FDV", "ATH", "ATL",
     "SV", "TR", "MH", "SK", "NAP",
-    # فارسی قالب
     "ریسک", "بالا", "متوسط", "کم", "درباره", "پروژه", "یادداشت", "تحلیلگر",
     "واچ", "لیست", "بیتفا", "آپدیت", "نمودار", "قیمت", "وبسایت",
     "صرافی", "سرمایه", "گذاران",
 }
 
 BULLISH_HINTS = re.compile(
-    r"(شکست|صعود|مقاومت|پشت\s*سر|تثبیت|ساختار\s*صعود|روند\s*صعود|حمایت|ورود|پتانسیل|آماده|بالای\s*این\s*سطح)",
+    r"(شکست|صعود|مقاومت|پشت\s*سر|تثبیت|ساختار\s*صعود|روند\s*صعود|حمایت|ورود|پتانسیل|آماده|"
+    r"بالای\s*این\s*سطح|هدف\s*(اولیه|قیمت)?|حفظ\s*کرده|رشد\s*داشته|محدوده\s*\d|"
+    r"breakout|bullish|uptrend|support\s*hold)",
     re.IGNORECASE,
 )
 BEARISH_HINTS = re.compile(
-    r"(ریزش|نزول|فشار\s*فروش|ساختار\s*نزولی|روند\s*نزولی|ضعیف|رد\s*شده|خطر)",
+    r"(ریزش|نزول|فشار\s*فروش|ساختار\s*نزولی|روند\s*نزولی|ضعیف|رد\s*شده|خطر|"
+    r"احتیاط\s*بالا|خروج|stop\s*out|bearish|breakdown)",
     re.IGNORECASE,
 )
 
@@ -88,7 +87,6 @@ def extract_tickers_from_text(text: str, strict: bool = False) -> List[str]:
     if strict or hashed:
         return hashed[:15]
 
-    # بدون هشتگ فقط نمادهای ۳+ حرف نزدیک به ریسک
     extra: List[str] = []
     for m in re.finditer(r"\b([A-Z]{3,10})\b\s*(?:ریسک\s*(?:بالا|متوسط|کم))?", text):
         t = m.group(1).upper()
@@ -107,12 +105,17 @@ def _clean_block(s: str) -> str:
 
 
 def _note_sentiment_boost(note: str) -> int:
+    """وزن قوی‌تر برای یادداشت‌های ساختاری صعودی BITFA."""
     if not note:
         return 0
     bull = len(BULLISH_HINTS.findall(note))
     bear = len(BEARISH_HINTS.findall(note))
-    score = bull * 2 - bear * 2
-    return max(-5, min(8, score))
+    score = bull * 3 - bear * 3
+    if re.search(r"ساختار\s*صعود", note) and re.search(r"هدف", note):
+        score += 3
+    if re.search(r"حفظ\s*کرده|رشد\s*داشته", note):
+        score += 2
+    return max(-6, min(12, score))
 
 
 def extract_entries_from_text(text: str) -> List[Dict[str, Any]]:
@@ -123,10 +126,8 @@ def extract_entries_from_text(text: str) -> List[Dict[str, Any]]:
     entries: List[Dict[str, Any]] = []
     seen: Set[str] = set()
 
-    # فقط هشتگ‌ها — دقیق‌ترین سیگنال نماد واقعی در PDF بیتفا
     hash_hits = list(re.finditer(r"#\s*([A-Za-z][A-Za-z0-9]{1,14})", raw))
 
-    # اگر هشتگ نبود، نماد کنار برچسب ریسک
     if not hash_hits:
         hash_hits = list(
             re.finditer(
@@ -177,25 +178,12 @@ def extract_entries_from_text(text: str) -> List[Dict[str, Any]]:
 
         about = ""
         am = re.search(
-            r"درباره\s*پروژه\s*[:\-]?\s*(.+?)(?=یادداشت\s*تحلیلگر|سرمایه‌گذاران|صرافی|وبسایت|$)",
+            r"درباره\s*پروژه\s*[:\-]?\s*(.+?)(?=یادداشت\s*تحلیلگر|سرمایه‌گذاران|صرافی|وبسایت|نمودار|$)",
             block,
             re.DOTALL | re.IGNORECASE,
         )
         if am:
-            about = _clean_block(am.group(1))
-            if len(about) > 500:
-                about = about[:500].rsplit(" ", 1)[0] + "…"
-
-        # فیلتر نویز: اگر نه یادداشت، نه درباره، نه ریسک → احتمالاً نام صرافی/VC است
-        quality = 0
-        if analyst_note:
-            quality += 3
-        if about:
-            quality += 2
-        if risk:
-            quality += 1
-        if quality == 0 and len(ticker) <= 3:
-            continue
+            about = _clean_block(am.group(1))[:350]
 
         boost = _note_sentiment_boost(analyst_note)
         seen.add(ticker)
@@ -205,33 +193,23 @@ def extract_entries_from_text(text: str) -> List[Dict[str, Any]]:
             "analyst_note": analyst_note,
             "about": about,
             "note_boost": boost,
-            "quality": quality,
         })
 
-    # اولویت با ورودی‌های باکیفیت (دارای یادداشت/درباره)
-    entries.sort(key=lambda e: e.get("quality", 0), reverse=True)
-    return entries[:12]
+    return entries[:20]
 
 
-def parse_watchlist_pdf(data: bytes) -> dict:
+def parse_watchlist_pdf(data: bytes) -> Dict[str, Any]:
     text = extract_text_from_pdf_bytes(data)
+    tickers = extract_tickers_from_text(text, strict=True)
     entries = extract_entries_from_text(text)
-
-    if entries:
-        # فقط تیکرهای با کیفیت معقول
-        good = [e for e in entries if e.get("quality", 0) >= 1]
-        tickers = [e["ticker"] for e in (good or entries)]
-    else:
-        tickers = extract_tickers_from_text(text, strict=True)
-
     notes_map: Dict[str, Dict[str, Any]] = {}
     for e in entries:
         notes_map[e["ticker"]] = e
-
+    for t in tickers:
+        notes_map.setdefault(t, {"ticker": t, "analyst_note": "", "about": "", "note_boost": 0, "risk_label": None})
     return {
-        "tickers": tickers,
+        "text_len": len(text or ""),
+        "tickers": tickers or [e["ticker"] for e in entries],
         "entries": entries,
         "notes_map": notes_map,
-        "text_preview": (text or "")[:800],
-        "chars": len(text or ""),
     }
