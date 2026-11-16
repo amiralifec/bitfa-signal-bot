@@ -1,6 +1,6 @@
 """
-BITFA Signal Scorer - Version 1.1.1
-pair-fix + Multi-TF PA + CoinGecko
+BITFA Signal Scorer - Version 1.2.0
+token-cache + pair-fix + Multi-TF PA + CoinGecko
 """
 
 import os
@@ -132,12 +132,6 @@ def select_best_pair(
     query_symbol: str = None,
     prefer_price: Optional[float] = None,
 ) -> Optional[Dict]:
-    """
-    انتخاب جفت واقعی‌تر:
-    - حجم مهم‌تر از لیکوئیدیتی اسمی (جلوگیری از LP مرده مثل EVAA سولانا)
-    - جریمه vol/liq خیلی پایین
-    - اگر قیمت مرجع CoinGecko داریم، جفت نزدیک به آن را ترجیح بده
-    """
     if not pairs:
         return None
     candidates = pairs
@@ -362,7 +356,7 @@ def calculate_score_from_metrics(
         reasons.append(f"رشد ۲۴س معقول: {price_change_24h:.1f}%")
     elif 55 < price_change_24h <= 120:
         score += 9
-        reasons.append(f"رشد ۲۴س قوی: {price_change_24h:.1f}%")
+        reasons.append(f"رشد زیاد: {price_change_24h:.1f}%")
         warnings.append("رشد زیاد → احتمال پولبک")
     elif price_change_24h > 120:
         score += 3
@@ -405,8 +399,16 @@ def calculate_score_from_metrics(
 
 
 def analyze_token(symbol: str = None, address: str = None) -> Dict[str, Any]:
+    if symbol and not address:
+        try:
+            from storage import get_cached_token
+            cached = get_cached_token(symbol)
+            if cached and cached.get("address"):
+                address = cached.get("address")
+        except Exception as e:
+            print(f"token cache read: {e}")
+
     prefer_price = None
-    early_cg = None
     if symbol and not address:
         early_cg = coingecko_search(symbol)
         if early_cg and early_cg.get("id"):
@@ -414,7 +416,7 @@ def analyze_token(symbol: str = None, address: str = None) -> Dict[str, Any]:
             if early_mkt:
                 prefer_price = safe_float(early_mkt.get("current_price"), None)
 
-    dex_data = get_dexscreener_data(token_address=address, symbol=symbol)
+    dex_data = get_dexscreener_data(token_address=address, symbol=symbol if not address else None)
     pair = None
     if dex_data and dex_data.get("pairs"):
         pair = select_best_pair(
@@ -640,6 +642,23 @@ def analyze_token(symbol: str = None, address: str = None) -> Dict[str, Any]:
     else:
         position_suggestion = "حداکثر ۳٪ تا ۴٪ از کل سرمایه"
 
+    try:
+        if (base_sym or symbol) and token_address:
+            from storage import set_cached_token
+            pair_addr = ""
+            if pair_url and "/" in pair_url:
+                pair_addr = pair_url.rstrip("/").split("/")[-1]
+            set_cached_token(
+                (base_sym or symbol or "").upper(),
+                address=token_address,
+                chain=chain or "",
+                pair_address=pair_addr,
+                name=base_name or "",
+                price_usd=price_usd,
+            )
+    except Exception as e:
+        print(f"token cache write: {e}")
+
     return {
         "score": score,
         "category": category,
@@ -673,5 +692,5 @@ def analyze_token(symbol: str = None, address: str = None) -> Dict[str, Any]:
             "chain": chain or None,
             "dex": dex or None,
         },
-        "note": "نسخه ۱.۱.۱ | pair-fix + Multi-TF PA | NFA | DYOR",
+        "note": "نسخه ۱.۲.۰ | token-cache + pair-fix + Multi-TF PA | NFA | DYOR",
     }
