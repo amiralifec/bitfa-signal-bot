@@ -1,6 +1,6 @@
 """
-BITFA Signal Scorer - Version 1.1.0
-تگ سهام/پرپ سخت‌گیرانه + Multi-TF Price Action + CoinGecko
+BITFA Signal Scorer - Version 1.1.1
+pair-fix + Multi-TF PA + CoinGecko
 """
 
 import os
@@ -127,7 +127,17 @@ def pair_age_hours(pair: Dict) -> Optional[float]:
         return None
 
 
-def select_best_pair(pairs: List[Dict], query_symbol: str = None) -> Optional[Dict]:
+def select_best_pair(
+    pairs: List[Dict],
+    query_symbol: str = None,
+    prefer_price: Optional[float] = None,
+) -> Optional[Dict]:
+    """
+    انتخاب جفت واقعی‌تر:
+    - حجم مهم‌تر از لیکوئیدیتی اسمی (جلوگیری از LP مرده مثل EVAA سولانا)
+    - جریمه vol/liq خیلی پایین
+    - اگر قیمت مرجع CoinGecko داریم، جفت نزدیک به آن را ترجیح بده
+    """
     if not pairs:
         return None
     candidates = pairs
@@ -140,17 +150,37 @@ def select_best_pair(pairs: List[Dict], query_symbol: str = None) -> Optional[Di
     for p in candidates:
         liq = safe_float((p.get("liquidity") or {}).get("usd", 0))
         vol = safe_float((p.get("volume") or {}).get("h24", 0))
+        price = safe_float(p.get("priceUsd"), None)
         chg = (p.get("priceChange") or {}).get("h24")
         if liq < 1500 and vol < 300:
             continue
-        pair_score = liq * 0.4 + vol * 0.6
+        pair_score = vol * 1.0 + min(liq, vol * 3) * 0.25
         if chg is not None:
-            pair_score *= 1.15
-        if liq > 0 and vol / liq < 0.05 and vol < 15000:
-            pair_score *= 0.5
+            pair_score *= 1.1
+        if liq > 0:
+            ratio = vol / liq
+            if ratio < 0.02:
+                pair_score *= 0.15
+            elif ratio < 0.08:
+                pair_score *= 0.45
+            elif ratio < 0.2:
+                pair_score *= 0.75
+        if price is not None and price < 1e-6 and vol < 50000:
+            pair_score *= 0.3
+        if prefer_price and prefer_price > 0 and price and price > 0:
+            rel = abs(price - prefer_price) / prefer_price
+            if rel <= 0.12:
+                pair_score *= 1.8
+            elif rel <= 0.30:
+                pair_score *= 1.25
+            elif rel >= 0.55:
+                pair_score *= 0.35
         scored.append((pair_score, p))
     if not scored:
-        return max(candidates, key=lambda p: safe_float((p.get("liquidity") or {}).get("usd", 0)))
+        return max(
+            candidates,
+            key=lambda p: safe_float((p.get("volume") or {}).get("h24", 0)),
+        )
     scored.sort(key=lambda x: x[0], reverse=True)
     return scored[0][1]
 
@@ -375,10 +405,23 @@ def calculate_score_from_metrics(
 
 
 def analyze_token(symbol: str = None, address: str = None) -> Dict[str, Any]:
+    prefer_price = None
+    early_cg = None
+    if symbol and not address:
+        early_cg = coingecko_search(symbol)
+        if early_cg and early_cg.get("id"):
+            early_mkt = coingecko_market(early_cg.get("id"))
+            if early_mkt:
+                prefer_price = safe_float(early_mkt.get("current_price"), None)
+
     dex_data = get_dexscreener_data(token_address=address, symbol=symbol)
     pair = None
     if dex_data and dex_data.get("pairs"):
-        pair = select_best_pair(dex_data.get("pairs") or [], query_symbol=symbol)
+        pair = select_best_pair(
+            dex_data.get("pairs") or [],
+            query_symbol=symbol,
+            prefer_price=prefer_price,
+        )
 
     liquidity = volume_24h = volume_6h = volume_1h = volume_m5 = market_cap = buys = sells = 0.0
     price_change_24h = price_change_6h = price_change_1h = price_change_m5 = price_usd = age_h = None
@@ -447,8 +490,54 @@ def analyze_token(symbol: str = None, address: str = None) -> Dict[str, Any]:
         cg_mkt = coingecko_market(cg_coin_id)
         if cg_mkt:
             rank = cg_mkt.get("market_cap_rank")
+            cg_price = safe_float(cg_mkt.get("current_price"), None)
+            if cg_price and cg_price > 0 and price_usd and price_usd > 0:
+                rel = abs(price_usd - cg_price) / cg_price
+                if rel >= 0.35 and dex_data and dex_data.get("pairs"):
+                    better = select_best_pair(
+                        dex_data.get("pairs") or [],
+                        query_symbol=symbol or base_sym,
+                        prefer_price=cg_price,
+                    )
+                    if better and better is not pair:
+                        pair = better
+                        liquidity = safe_float((pair.get("liquidity") or {}).get("usd", 0))
+                        vol = pair.get("volume") or {}
+                        pc = pair.get("priceChange") or {}
+                        volume_24h = safe_float(vol.get("h24", 0))
+                        volume_6h = safe_float(vol.get("h6", 0))
+                        volume_1h = safe_float(vol.get("h1", 0))
+                        volume_m5 = safe_float(vol.get("m5", 0))
+                        if pc.get("h24") is not None:
+                            price_change_24h = safe_float(pc.get("h24"), None)
+                        if pc.get("h6") is not None:
+                            price_change_6h = safe_float(pc.get("h6"), None)
+                        if pc.get("h1") is not None:
+                            price_change_1h = safe_float(pc.get("h1"), None)
+                        if pc.get("m5") is not None:
+                            price_change_m5 = safe_float(pc.get("m5"), None)
+                        price_usd = safe_float(pair.get("priceUsd"), None) or cg_price
+                        fdv = safe_float(pair.get("fdv", 0))
+                        market_cap = safe_float(pair.get("marketCap", 0)) or fdv or market_cap
+                        txns = (pair.get("txns") or {}).get("h24", {}) or {}
+                        buys = safe_float(txns.get("buys", 0))
+                        sells = safe_float(txns.get("sells", 0))
+                        chain = pair.get("chainId") or chain
+                        dex = pair.get("dexId") or dex
+                        base = pair.get("baseToken") or {}
+                        if base.get("symbol"):
+                            base_sym = (base.get("symbol") or base_sym).upper()
+                        if base.get("name"):
+                            base_name = base.get("name") or base_name
+                        token_address = base.get("address") or token_address
+                        age_h = pair_age_hours(pair)
+                        pair_addr = pair.get("pairAddress")
+                        if chain and pair_addr:
+                            pair_url = f"https://dexscreener.com/{chain}/{pair_addr}"
+                if price_usd and cg_price and abs(price_usd - cg_price) / cg_price >= 0.35:
+                    price_usd = cg_price
             if price_usd is None:
-                price_usd = safe_float(cg_mkt.get("current_price"), None)
+                price_usd = cg_price
             if market_cap <= 0:
                 market_cap = safe_float(cg_mkt.get("market_cap"), 0)
             if price_change_24h is None:
@@ -584,5 +673,5 @@ def analyze_token(symbol: str = None, address: str = None) -> Dict[str, Any]:
             "chain": chain or None,
             "dex": dex or None,
         },
-        "note": "نسخه ۱.۱.۰ | Multi-TF PA m5/h1/h6/h24 | NFA | DYOR",
+        "note": "نسخه ۱.۱.۱ | pair-fix + Multi-TF PA | NFA | DYOR",
     }
