@@ -1,5 +1,5 @@
 """
-خواندن کانال BITFA - timeout + یادداشت تحلیلگر + حافظه اسکن + مومنتوم پامپ
+خواندن کانال BITFA - timeout + یادداشت تحلیلگر + حافظه اسکن + مومنتوم پامپ + کول‌داون دامپ
 """
 
 import os
@@ -234,7 +234,7 @@ async def scan_and_score(limit_messages: int = 30, persist: bool = True) -> Dict
     pump_meta: Dict[str, Any] = {}
     try:
         from pump_monitor import fetch_pump_index, evaluate_pump_for_ticker, apply_pump_to_result
-        pump_meta = await asyncio.wait_for(fetch_pump_index(limit_messages=80, hours=24), timeout=45)
+        pump_meta = await asyncio.wait_for(fetch_pump_index(limit_messages=100, hours=24), timeout=45)
         pump_index = pump_meta.get("index") or {}
     except Exception as e:
         print(f"pump index skip: {e}")
@@ -254,6 +254,11 @@ async def scan_and_score(limit_messages: int = 30, persist: bool = True) -> Dict
                     entry_phase=r.get("entry_phase") or "",
                 )
                 r = apply_pump_to_result(r, pe)
+            try:
+                from storage import apply_dump_cooldown_guard
+                r = apply_dump_cooldown_guard(r)
+            except Exception as ce:
+                print(f"cooldown guard: {ce}")
             score = int(r.get("score") or 0)
             scored_rows.append((score, t, r))
         except Exception as e:
