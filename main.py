@@ -1,6 +1,6 @@
 """
 BITFA Scorer + Telegram Bot
-نسخه ۱.۸.۰ - token-cache + upgrade alerts
+نسخه ۱.۸.۱ - entry phase display
 """
 
 import os
@@ -25,7 +25,7 @@ WEBHOOK_BASE = os.getenv("RENDER_EXTERNAL_URL") or "https://bitfa-signal-bot.onr
 CRON_SECRET = os.getenv("CRON_SECRET") or ""
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID") or ""
 
-app = FastAPI(title="BITFA Signal Scorer", version="1.8.0")
+app = FastAPI(title="BITFA Signal Scorer", version="1.8.1")
 
 _scan_locks: Set[int] = set()
 _processed_updates: Set[int] = set()
@@ -84,16 +84,25 @@ def extract_tickers_and_addresses(text: str) -> List[str]:
 def _pa_line(result: dict) -> str:
     pa = result.get("pa_score")
     tags = result.get("pa_tags") or []
+    phase = result.get("entry_phase") or ""
     if pa is None:
         return ""
-    meaningful = [t for t in tags if t not in ("LowActivity", "Neutral", "-")]
-    if int(pa or 0) <= 0 and not meaningful:
+    meaningful = [t for t in tags if t not in ("LowActivity", "Neutral", "-", "ChaseRisk")]
+    if int(pa or 0) <= 0 and not meaningful and phase in ("", "NEUTRAL"):
         return ""
     if int(pa or 0) == 0 and tags == ["LowActivity"]:
         return ""
     show = meaningful or tags
     tag_txt = ", ".join(show[:3]) if show else "-"
-    return f" | PA:{pa}/20 ({tag_txt})"
+    phase_map = {
+        "EARLY": "🌱EARLY",
+        "DEVELOPING": "🟢DEV",
+        "EXTENDED": "🟡EXT",
+        "EXHAUSTED": "🔴EXH",
+        "BEARISH": "⬇️BEAR",
+    }
+    phase_txt = f" {phase_map[phase]}" if phase in phase_map else ""
+    return f" | PA:{pa}/20 ({tag_txt}){phase_txt}"
 
 
 def _search_tags(token: str) -> str:
@@ -213,6 +222,10 @@ def format_full(result: dict) -> str:
     if pa_score is not None and (int(pa_score or 0) > 0 or meaningful):
         tag_str = ", ".join(meaningful or pa_tags) if (meaningful or pa_tags) else "-"
         lines.append(f"📐 *Price Action:* {pa_score}/20 | {tag_str}")
+    phase = result.get("entry_phase")
+    phase_label = result.get("phase_label") or ""
+    if phase and phase not in ("NEUTRAL", ""):
+        lines.append(f"🎯 *فاز ورود:* {phase} — {phase_label}")
     lines += ["", f"📝 *توصیه:*\n{rec}"]
     if analyst_note:
         lines.append("\n📌 *یادداشت تحلیلگر BITFA:*")
@@ -487,7 +500,10 @@ def _send_upgrade_alerts(chat_id: int, data: dict) -> None:
         except Exception:
             tags = "#" + str(t)
         note = (r.get("analyst_note") or "")[:120]
+        phase = r.get("entry_phase") or ""
         line = f"{emoji} *ارتقای سریع:* #{t} → {cat} ({score}/100)" + "\n" + f"💵 {price}"
+        if phase and phase not in ("NEUTRAL", ""):
+            line += f"\n🎯 فاز: {phase}"
         if tags:
             line += "\n" + tags
         if note:
@@ -524,12 +540,12 @@ def run_scan_job_thread(chat_id: int, daily: bool = False):
 
 @app.get("/")
 def root():
-    return {"status": "ok", "version": "1.8.0", "message": "BITFA Scorer - score delta + notes", "bot": "enabled" if BOT_TOKEN else "disabled", "cron": "/cron/daily-scan?key=CRON_SECRET&chat_id=YOUR_CHAT_ID"}
+    return {"status": "ok", "version": "1.8.1", "message": "BITFA Scorer - entry phase", "bot": "enabled" if BOT_TOKEN else "disabled", "cron": "/cron/daily-scan?key=CRON_SECRET&chat_id=YOUR_CHAT_ID"}
 
 
 @app.get("/health")
 def health():
-    return {"status": "healthy", "version": "1.8.0"}
+    return {"status": "healthy", "version": "1.8.1"}
 
 
 @app.get("/cron/daily-scan")
@@ -601,7 +617,7 @@ async def telegram_webhook(request: Request):
     if not text:
         return Response(status_code=200)
     if text.startswith("/start"):
-        send_telegram_message(chat_id, "سلام 👋\nربات BITFA + PA + یادداشت + تگ سرچ + delta\n\n• تیکر / آدرس / PDF بفرست\n• /scan اسکن کانال")
+        send_telegram_message(chat_id, "سلام 👋\nربات BITFA + PA + فاز ورود + تگ سرچ\n\n• تیکر / آدرس / PDF بفرست\n• /scan اسکن کانال")
         return Response(status_code=200)
     if text.startswith("/help"):
         send_telegram_message(chat_id, "دستورات:\n/scan — اسکن کانال\nتیکر/آدرس/PDF را مستقیم بفرست.")
