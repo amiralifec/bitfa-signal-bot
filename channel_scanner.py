@@ -1,5 +1,5 @@
 """
-خواندن کانال BITFA - timeout + یادداشت تحلیلگر + حافظه اسکن + مومنتوم پامپ + کول‌داون دامپ
+خواندن کانال BITFA - timeout + یادداشت تحلیلگر + حافظه اسکن + مومنتوم پامپ + کول‌داون + streak + BTC
 """
 
 import os
@@ -241,6 +241,14 @@ async def scan_and_score(limit_messages: int = 30, persist: bool = True) -> Dict
         pump_index = {}
 
     scored_rows: List[Tuple[int, str, dict]] = []
+    try:
+        from storage import load_last_scan, get_btc_regime
+        prev_for_streak = load_last_scan()
+        btc_regime = get_btc_regime()
+    except Exception as e:
+        print(f"regime/streak init: {e}")
+        prev_for_streak = {"tickers": {}}
+        btc_regime = {"regime": "unknown", "change_24h": None}
 
     for t in tickers[:10]:
         try:
@@ -255,10 +263,12 @@ async def scan_and_score(limit_messages: int = 30, persist: bool = True) -> Dict
                 )
                 r = apply_pump_to_result(r, pe)
             try:
-                from storage import apply_dump_cooldown_guard
+                from storage import apply_streak_boost, apply_dump_cooldown_guard, apply_btc_regime_guard
+                r = apply_streak_boost(r, prev_for_streak)
                 r = apply_dump_cooldown_guard(r)
+                r = apply_btc_regime_guard(r, btc_regime)
             except Exception as ce:
-                print(f"cooldown guard: {ce}")
+                print(f"post-score guards: {ce}")
             score = int(r.get("score") or 0)
             scored_rows.append((score, t, r))
         except Exception as e:
@@ -283,6 +293,7 @@ async def scan_and_score(limit_messages: int = 30, persist: bool = True) -> Dict
             "category": cat,
             "token": token,
             "pa_score": r.get("pa_score"),
+            "streak": r.get("streak"),
         }
 
     prev = load_last_scan()
@@ -308,4 +319,5 @@ async def scan_and_score(limit_messages: int = 30, persist: bool = True) -> Dict
         "diff": diff,
         "pump_tickers": list(pump_index.keys()) if pump_index else [],
         "pump_messages_checked": (pump_meta or {}).get("messages_checked", 0),
+        "btc_regime": btc_regime,
     }
