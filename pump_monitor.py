@@ -74,11 +74,7 @@ def parse_pump_message(text: str) -> Optional[Dict[str, Any]]:
     }
 
 
-async def fetch_pump_index(limit_messages: int = 80, hours: int = 24) -> Dict[str, Any]:
-    """
-    همه پیام‌های قابل‌پارس ~۲۴ساعت اخیر را به صورت
-    {TICKER: [events newest-first]} برمی‌گرداند.
-    """
+async def fetch_pump_index(limit_messages: int = 100, hours: int = 24) -> Dict[str, Any]:
     if not SESSION or not API_ID or not API_HASH:
         return {"error": "session missing", "index": {}, "messages_checked": 0}
 
@@ -130,11 +126,11 @@ def evaluate_pump_for_ticker(
     entry_phase: str = "",
 ) -> Dict[str, Any]:
     """
-    برای یک نماد از روی ایندکس پامپ، بوست امتیاز و خلاصه برمی‌گرداند.
+    بوست/جریمه بر اساس تاریخچه ۲۴س کانال پامپ.
 
-    منطق (نسخه EVAA):
-    - چند UP با حجم بالا در شروع موج → بوست مثبت
-    - آخرین‌ها DOWN یا رشد ۲۴س خیلی بالا بعد از موج → جریمه / بدون بوست
+    مثال LIT: DOWN 7.9% + Vol+3200% + ch24=-17% → جریمه سنگین
+    مثال KITE: DOWN 2% + Vol+200% → جریمه متوسط
+    مثال شروع موج: چند UP با حجم و ch24 معقول → بوست
     """
     t = (ticker or "").upper().strip()
     if t.endswith("USDT"):
@@ -152,53 +148,101 @@ def evaluate_pump_for_ticker(
     max_ch24 = max(ch24s) if ch24s else None
     min_ch24 = min(ch24s) if ch24s else None
     prices = [float(e["price"]) for e in events if e.get("price") is not None]
-    price_first = prices[-1] if prices else None  # oldest in list order newest-first
+    price_first = prices[-1] if prices else None
     price_last = prices[0] if prices else None
 
     boost = 0
     notes = []
+    severe_dump = False
 
-    # جریمه اگر آخرین سیگنال DOWN با حجم باشد
-    if latest.get("direction") == "DOWN" and float(latest.get("vol_up_pct") or 0) >= 100:
-        boost -= 4
-        notes.append(f"آخرین هشدار پامپ: DOWN ({latest.get('move_pct')}%)")
-    elif latest.get("direction") == "UP" and float(latest.get("vol_up_pct") or 0) >= 150:
-        boost += 3
-        notes.append(f"هشدار پامپ اخیر: UP +{latest.get('move_pct')}% / Vol+{latest.get('vol_up_pct')}%")
+    lat_dir = (latest.get("direction") or "").upper()
+    lat_vol = float(latest.get("vol_up_pct") or 0)
+    lat_move = float(latest.get("move_pct") or 0)
+    lat_ch24 = latest.get("change_24h")
+    lat_ch24_f = float(lat_ch24) if lat_ch24 is not None else None
 
-    # تعداد UPهای قوی در ۲۴س
-    strong_ups = [e for e in ups if float(e.get("vol_up_pct") or 0) >= 150 and float(e.get("move_pct") or 0) >= 3]
-    if len(strong_ups) >= 3:
-        boost += 4
-        notes.append(f"{len(strong_ups)} سیگنال UP قوی در ۲۴س")
-    elif len(strong_ups) >= 1:
-        boost += 2
-        notes.append(f"{len(strong_ups)} سیگنال UP با حجم")
+    # --- DOWN اخیر (مهم‌ترین فیلتر ضد-ورود) ---
+    if lat_dir == "DOWN":
+        if lat_vol >= 1000 and lat_move >= 5:
+            # مثل LIT: ریزش تند با حجم انفجاری
+            boost -= 12
+            severe_dump = True
+            notes.append(f"دامپ سنگین پامپ: DOWN {lat_move}% / Vol+{lat_vol:.0f}%")
+        elif lat_vol >= 400 and lat_move >= 4:
+            boost -= 8
+            severe_dump = True
+            notes.append(f"DOWN قوی پامپ: {lat_move}% / Vol+{lat_vol:.0f}%")
+        elif lat_vol >= 150 and lat_move >= 2:
+            boost -= 5
+            notes.append(f"آخرین هشدار پامپ: DOWN {lat_move}% / Vol+{lat_vol:.0f}%")
+        elif lat_vol >= 80:
+            boost -= 3
+            notes.append(f"آخرین هشدار پامپ: DOWN {lat_move}%")
 
-    if max_vol >= 300:
-        boost += 2
-        notes.append(f"اوج Volume up: +{max_vol:.0f}%")
+        if lat_ch24_f is not None and lat_ch24_f <= -12:
+            boost -= 4
+            severe_dump = True
+            notes.append(f"در پامپ: تغییر ۲۴س {lat_ch24_f:.0f}%")
+        elif lat_ch24_f is not None and lat_ch24_f <= -5:
+            boost -= 2
+            notes.append(f"در پامپ: تغییر ۲۴س {lat_ch24_f:.0f}%")
 
-    # اگر موج خیلی جلو رفته (chase)
-    if max_ch24 is not None and max_ch24 >= 90:
+    elif lat_dir == "UP":
+        if lat_vol >= 150:
+            boost += 3
+            notes.append(f"هشدار پامپ اخیر: UP +{lat_move}% / Vol+{lat_vol:.0f}%")
+        if lat_ch24_f is not None and lat_ch24_f >= 80:
+            boost -= 4
+            notes.append(f"UP ولی رشد ۲۴س اشباع (+{lat_ch24_f:.0f}%)")
+
+    # چند DOWN قوی در ۲۴س
+    strong_downs = [
+        e for e in downs
+        if float(e.get("vol_up_pct") or 0) >= 300 and float(e.get("move_pct") or 0) >= 3
+    ]
+    if len(strong_downs) >= 2:
+        boost -= 3
+        notes.append(f"{len(strong_downs)} سیگنال DOWN قوی در ۲۴س")
+
+    strong_ups = [
+        e for e in ups
+        if float(e.get("vol_up_pct") or 0) >= 150 and float(e.get("move_pct") or 0) >= 3
+    ]
+    if not severe_dump:
+        if len(strong_ups) >= 3:
+            boost += 4
+            notes.append(f"{len(strong_ups)} سیگنال UP قوی در ۲۴س")
+        elif len(strong_ups) >= 1:
+            boost += 2
+            notes.append(f"{len(strong_ups)} سیگنال UP با حجم")
+
+    # حجم بالا به تنهایی مثبت نیست اگر آخرین حرکت DOWN باشد
+    if max_vol >= 500 and lat_dir != "DOWN" and not severe_dump:
+        boost += 1
+
+    if max_ch24 is not None and max_ch24 >= 90 and not severe_dump:
         boost -= 5
-        notes.append(f"رشد ۲۴س در کانال پامپ تا +{max_ch24:.0f}% (ریسک chase)")
-    elif max_ch24 is not None and max_ch24 >= 55:
+        notes.append(f"رشد ۲۴س در پامپ تا +{max_ch24:.0f}% (ریسک chase)")
+    elif max_ch24 is not None and max_ch24 >= 55 and not severe_dump:
         boost -= 2
-        notes.append(f"رشد ۲۴س بالا در پامپ (+{max_ch24:.0f}%)")
 
-    # هم‌راستایی با فاز ورود سیستم خودمان
+    if min_ch24 is not None and min_ch24 <= -15:
+        boost -= 3
+        severe_dump = True
+        notes.append(f"کف تغییر ۲۴س در پامپ: {min_ch24:.0f}%")
+
     phase = (entry_phase or "").upper()
-    if phase in ("EARLY", "DEVELOPING") and boost > 0:
+    if severe_dump:
+        # بعد از دامپ، EARLY/DEVELOPING بی‌معنی است برای بوست
+        boost = min(boost, -6)
+        notes.append("دامپ اخیر: بوست مثبت غیرفعال")
+    elif phase in ("EARLY", "DEVELOPING") and boost > 0:
         boost += 2
         notes.append(f"هم‌راستا با فاز {phase}")
     if phase in ("EXHAUSTED", "BEARISH") and boost > 0:
-        boost = min(boost, 1)
-        notes.append(f"فاز {phase}: بوست پامپ محدود شد")
-    if phase == "EXHAUSTED":
         boost = min(boost, 0)
 
-    boost = max(-8, min(10, int(boost)))
+    boost = max(-15, min(10, int(boost)))
 
     summary = {
         "ticker": t,
@@ -208,9 +252,11 @@ def evaluate_pump_for_ticker(
         "max_vol_up": max_vol,
         "max_up_move": max_up_move,
         "max_change_24h": max_ch24,
+        "min_change_24h": min_ch24,
         "price_first": price_first,
         "price_last": price_last,
-        "latest_direction": latest.get("direction"),
+        "latest_direction": lat_dir,
+        "severe_dump": severe_dump,
         "notes": notes,
         "boost": boost,
     }
@@ -227,24 +273,32 @@ def apply_pump_to_result(r: dict, pump_eval: Dict[str, Any]) -> dict:
     r = dict(r)
     if summary:
         r["pump_summary"] = summary
-    if boost:
-        old = int(r.get("score") or 0)
-        new_score = max(0, min(100, old + boost))
+
+    old = int(r.get("score") or 0)
+    new_score = max(0, min(100, old + boost))
+    # دامپ سنگین: سقف امتیاز را هم پایین بیاور تا QUALIFIED جعلی نماند
+    if summary and summary.get("severe_dump"):
+        new_score = min(new_score, 45)
+        r["entry_phase"] = "BEARISH"
+        r["phase_label"] = "دامپ اخیر کانال پامپ — ورود نکن"
+
+    if boost or (summary and summary.get("severe_dump")):
         r["score"] = new_score
         r["pump_boost"] = boost
         reasons = list(r.get("reasons") or [])
         warnings = list(r.get("warnings") or [])
         if boost > 0:
             reasons.insert(0, f"مومنتوم کانال پامپ: مثبت (+{boost})")
-        else:
+        elif boost < 0:
             warnings.insert(0, f"مومنتوم کانال پامپ: منفی ({boost})")
         for n in (summary or {}).get("notes") or []:
-            if boost > 0:
+            if boost > 0 and not (summary or {}).get("severe_dump"):
                 reasons.append(f"پامپ: {n}")
             else:
                 warnings.append(f"پامپ: {n}")
         r["reasons"] = reasons[:10]
         r["warnings"] = warnings[:8]
+
         conf = int(r.get("confidence") or 0)
         if new_score >= 80 and conf >= 70:
             r["category"], r["recommendation"], r["action"] = (
