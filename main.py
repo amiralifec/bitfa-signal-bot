@@ -1,6 +1,6 @@
 """
 BITFA Scorer + Telegram Bot
-نسخه ۱.۹.۱ - audit fixes
+نسخه ۱.۹.۲ - dump cooldown
 """
 
 import os
@@ -25,7 +25,7 @@ WEBHOOK_BASE = os.getenv("RENDER_EXTERNAL_URL") or "https://bitfa-signal-bot.onr
 CRON_SECRET = os.getenv("CRON_SECRET") or ""
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID") or ""
 
-app = FastAPI(title="BITFA Signal Scorer", version="1.9.1")
+app = FastAPI(title="BITFA Signal Scorer", version="1.9.2")
 
 _scan_locks: Set[int] = set()
 _processed_updates: Set[int] = set()
@@ -420,6 +420,11 @@ def score_ticker_list(tickers: List[str], notes_map: Optional[Dict[str, Any]] = 
                     r = apply_pump_to_result(r, pe)
                 except Exception as pe_err:
                     logger.error(f"pump apply: {pe_err}")
+            try:
+                from storage import apply_dump_cooldown_guard
+                r = apply_dump_cooldown_guard(r)
+            except Exception as ce:
+                logger.error(f"cooldown guard: {ce}")
             rows.append((int(r.get("score") or 0), t, r))
         except Exception as e:
             rows.append((0, t, {"error": str(e)[:100], "score": 0, "category": "SKIP", "token": t}))
@@ -555,12 +560,12 @@ def run_scan_job_thread(chat_id: int, daily: bool = False):
 
 @app.get("/")
 def root():
-    return {"status": "ok", "version": "1.9.1", "message": "BITFA Scorer - integrated pump", "bot": "enabled" if BOT_TOKEN else "disabled", "cron": "/cron/daily-scan?key=CRON_SECRET&chat_id=YOUR_CHAT_ID"}
+    return {"status": "ok", "version": "1.9.2", "message": "BITFA Scorer - dump cooldown", "bot": "enabled" if BOT_TOKEN else "disabled", "cron": "/cron/daily-scan?key=CRON_SECRET&chat_id=YOUR_CHAT_ID"}
 
 
 @app.get("/health")
 def health():
-    return {"status": "healthy", "version": "1.9.1"}
+    return {"status": "healthy", "version": "1.9.2"}
 
 
 @app.get("/cron/daily-scan")
@@ -639,10 +644,10 @@ async def telegram_webhook(request: Request):
     if not text:
         return Response(status_code=200)
     if text.startswith("/start"):
-        send_telegram_message(chat_id, "سلام 👋\nربات BITFA + PA + فاز + پامپ\n\n• تیکر / آدرس / PDF بفرست\n• /scan اسکن BITFA (+ مومنتوم پامپ)")
+        send_telegram_message(chat_id, "سلام 👋\nربات BITFA + PA + فاز + پامپ + کول‌داون دامپ\n\n• تیکر / آدرس / PDF بفرست\n• /scan اسکن BITFA")
         return Response(status_code=200)
     if text.startswith("/help"):
-        send_telegram_message(chat_id, "دستورات:\n/scan — اسکن BITFA (+ لایه پامپ)\nتیکر/آدرس/PDF را مستقیم بفرست.")
+        send_telegram_message(chat_id, "دستورات:\n/scan — اسکن BITFA (+ پامپ + کول‌داون)\nتیکر/آدرس/PDF را مستقیم بفرست.")
         return Response(status_code=200)
     if text.startswith("/scan"):
         if chat_id in _scan_locks:
@@ -667,6 +672,11 @@ async def telegram_webhook(request: Request):
                 result = analyze_token(address=item)
             else:
                 result = analyze_token(symbol=item.upper())
+            try:
+                from storage import apply_dump_cooldown_guard
+                result = apply_dump_cooldown_guard(result)
+            except Exception:
+                pass
             name = result.get("token") or item
             results.append((name, result))
             cat = result.get("category", "SKIP")
