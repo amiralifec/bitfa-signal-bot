@@ -1,6 +1,6 @@
 """
 BITFA Scorer + Telegram Bot
-نسخه ۱.۹.۲ - dump cooldown
+نسخه ۱.۹.۳ - streak + BTC regime
 """
 
 import os
@@ -25,7 +25,7 @@ WEBHOOK_BASE = os.getenv("RENDER_EXTERNAL_URL") or "https://bitfa-signal-bot.onr
 CRON_SECRET = os.getenv("CRON_SECRET") or ""
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID") or ""
 
-app = FastAPI(title="BITFA Signal Scorer", version="1.9.2")
+app = FastAPI(title="BITFA Signal Scorer", version="1.9.3")
 
 _scan_locks: Set[int] = set()
 _processed_updates: Set[int] = set()
@@ -281,6 +281,13 @@ def format_scan(data: dict) -> str:
         f"پیام: {data.get('messages_checked', 0)} | PDF: {data.get('pdfs_parsed', 0)} | تیکر: {len(data.get('tickers_found') or [])}",
         "",
     ]
+    btc = data.get("btc_regime") or {}
+    if btc.get("change_24h") is not None:
+        ch = float(btc["change_24h"])
+        reg = btc.get("regime") or ""
+        flag = "⚠️ risk-off" if reg == "risk_off" else ("✅ risk-on" if reg == "risk_on" else "neutral")
+        lines.append(f"₿ BTC ۲۴س: {ch:+.1f}% ({flag})")
+        lines.append("")
     if summary.get("HOT"):
         lines.append("🔥 *HOT:* " + ", ".join(summary["HOT"]))
     if summary.get("QUALIFIED"):
@@ -409,6 +416,13 @@ def score_ticker_list(tickers: List[str], notes_map: Optional[Dict[str, Any]] = 
     results = []
     summary = {"HOT": [], "QUALIFIED": [], "WATCH": [], "SKIP": []}
     rows = []
+    try:
+        from storage import load_last_scan, get_btc_regime
+        prev_for_streak = load_last_scan()
+        btc_regime = get_btc_regime()
+    except Exception:
+        prev_for_streak = {"tickers": {}}
+        btc_regime = {"regime": "unknown", "change_24h": None}
     for t in tickers[:15]:
         try:
             r = analyze_token(symbol=t)
@@ -421,10 +435,12 @@ def score_ticker_list(tickers: List[str], notes_map: Optional[Dict[str, Any]] = 
                 except Exception as pe_err:
                     logger.error(f"pump apply: {pe_err}")
             try:
-                from storage import apply_dump_cooldown_guard
+                from storage import apply_streak_boost, apply_dump_cooldown_guard, apply_btc_regime_guard
+                r = apply_streak_boost(r, prev_for_streak)
                 r = apply_dump_cooldown_guard(r)
+                r = apply_btc_regime_guard(r, btc_regime)
             except Exception as ce:
-                logger.error(f"cooldown guard: {ce}")
+                logger.error(f"post-score guards: {ce}")
             rows.append((int(r.get("score") or 0), t, r))
         except Exception as e:
             rows.append((0, t, {"error": str(e)[:100], "score": 0, "category": "SKIP", "token": t}))
@@ -448,6 +464,7 @@ def score_ticker_list(tickers: List[str], notes_map: Optional[Dict[str, Any]] = 
             "category": r.get("category") or "SKIP",
             "token": tok,
             "pa_score": r.get("pa_score"),
+            "streak": r.get("streak"),
         }
     try:
         from storage import load_last_scan, save_last_scan, diff_with_previous
@@ -464,6 +481,7 @@ def score_ticker_list(tickers: List[str], notes_map: Optional[Dict[str, Any]] = 
         "summary": summary,
         "results": focus + skips,
         "diff": diff,
+        "btc_regime": btc_regime,
     }
 
 
@@ -560,12 +578,12 @@ def run_scan_job_thread(chat_id: int, daily: bool = False):
 
 @app.get("/")
 def root():
-    return {"status": "ok", "version": "1.9.2", "message": "BITFA Scorer - dump cooldown", "bot": "enabled" if BOT_TOKEN else "disabled", "cron": "/cron/daily-scan?key=CRON_SECRET&chat_id=YOUR_CHAT_ID"}
+    return {"status": "ok", "version": "1.9.3", "message": "BITFA Scorer - streak + BTC", "bot": "enabled" if BOT_TOKEN else "disabled", "cron": "/cron/daily-scan?key=CRON_SECRET&chat_id=YOUR_CHAT_ID"}
 
 
 @app.get("/health")
 def health():
-    return {"status": "healthy", "version": "1.9.2"}
+    return {"status": "healthy", "version": "1.9.3"}
 
 
 @app.get("/cron/daily-scan")
@@ -644,10 +662,10 @@ async def telegram_webhook(request: Request):
     if not text:
         return Response(status_code=200)
     if text.startswith("/start"):
-        send_telegram_message(chat_id, "سلام 👋\nربات BITFA + PA + فاز + پامپ + کول‌داون دامپ\n\n• تیکر / آدرس / PDF بفرست\n• /scan اسکن BITFA")
+        send_telegram_message(chat_id, "سلام 👋\nربات BITFA + PA + فاز + پامپ + کول‌داون + streak + BTC\n\n• تیکر / آدرس / PDF بفرست\n• /scan اسکن BITFA")
         return Response(status_code=200)
     if text.startswith("/help"):
-        send_telegram_message(chat_id, "دستورات:\n/scan — اسکن BITFA (+ پامپ + کول‌داون)\nتیکر/آدرس/PDF را مستقیم بفرست.")
+        send_telegram_message(chat_id, "دستورات:\n/scan — اسکن BITFA\nتیکر/آدرس/PDF را مستقیم بفرست.")
         return Response(status_code=200)
     if text.startswith("/scan"):
         if chat_id in _scan_locks:
@@ -673,8 +691,10 @@ async def telegram_webhook(request: Request):
             else:
                 result = analyze_token(symbol=item.upper())
             try:
-                from storage import apply_dump_cooldown_guard
+                from storage import apply_streak_boost, apply_dump_cooldown_guard, apply_btc_regime_guard, load_last_scan, get_btc_regime
+                result = apply_streak_boost(result, load_last_scan())
                 result = apply_dump_cooldown_guard(result)
+                result = apply_btc_regime_guard(result, get_btc_regime())
             except Exception:
                 pass
             name = result.get("token") or item
