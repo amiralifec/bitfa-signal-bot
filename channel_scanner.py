@@ -1,5 +1,5 @@
 """
-خواندن کانال BITFA - timeout + یادداشت تحلیلگر + حافظه اسکن + مومنتوم پامپ + کول‌داون + streak + BTC
+خواندن کانال BITFA - پامپ + رتبه‌بندی رشد/FR + کول‌داون + streak + BTC
 """
 
 import os
@@ -240,6 +240,16 @@ async def scan_and_score(limit_messages: int = 30, persist: bool = True) -> Dict
         print(f"pump index skip: {e}")
         pump_index = {}
 
+    rank_index: Dict[str, Any] = {}
+    rank_meta: Dict[str, Any] = {}
+    try:
+        from growth_rank_monitor import fetch_growth_rank_index
+        rank_meta = await asyncio.wait_for(fetch_growth_rank_index(limit_messages=40, hours=24), timeout=40)
+        rank_index = rank_meta.get("index") or {}
+    except Exception as e:
+        print(f"growth rank skip: {e}")
+        rank_index = {}
+
     scored_rows: List[Tuple[int, str, dict]] = []
     try:
         from storage import load_last_scan, get_btc_regime
@@ -262,6 +272,15 @@ async def scan_and_score(limit_messages: int = 30, persist: bool = True) -> Dict
                     entry_phase=r.get("entry_phase") or "",
                 )
                 r = apply_pump_to_result(r, pe)
+            if rank_index:
+                try:
+                    from growth_rank_monitor import evaluate_growth_rank_for_ticker, apply_growth_rank_to_result
+                    re = evaluate_growth_rank_for_ticker(
+                        t, rank_index, entry_phase=r.get("entry_phase") or "",
+                    )
+                    r = apply_growth_rank_to_result(r, re)
+                except Exception as re_err:
+                    print(f"growth rank apply: {re_err}")
             try:
                 from storage import apply_streak_boost, apply_dump_cooldown_guard, apply_btc_regime_guard
                 r = apply_streak_boost(r, prev_for_streak)
@@ -320,4 +339,6 @@ async def scan_and_score(limit_messages: int = 30, persist: bool = True) -> Dict
         "pump_tickers": list(pump_index.keys()) if pump_index else [],
         "pump_messages_checked": (pump_meta or {}).get("messages_checked", 0),
         "btc_regime": btc_regime,
+        "growth_rank_tickers": list(rank_index.keys()) if rank_index else [],
+        "growth_rank_messages": (rank_meta or {}).get("messages_checked", 0),
     }
