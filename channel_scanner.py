@@ -1,5 +1,5 @@
 """
-خواندن کانال BITFA - timeout + یادداشت تحلیلگر + حافظه اسکن
+خواندن کانال BITFA - timeout + یادداشت تحلیلگر + حافظه اسکن + مومنتوم پامپ
 """
 
 import os
@@ -230,12 +230,30 @@ async def scan_and_score(limit_messages: int = 30, persist: bool = True) -> Dict
             "diff": {"new": [], "improved": [], "dropped": [], "unchanged_hot": []},
         }
 
+    pump_index: Dict[str, Any] = {}
+    pump_meta: Dict[str, Any] = {}
+    try:
+        from pump_monitor import fetch_pump_index, evaluate_pump_for_ticker, apply_pump_to_result
+        pump_meta = await asyncio.wait_for(fetch_pump_index(limit_messages=80, hours=24), timeout=45)
+        pump_index = pump_meta.get("index") or {}
+    except Exception as e:
+        print(f"pump index skip: {e}")
+        pump_index = {}
+
     scored_rows: List[Tuple[int, str, dict]] = []
 
     for t in tickers[:10]:
         try:
             r = analyze_token(symbol=t)
             r = _apply_note_to_result(r, notes_map.get(t.upper()) or notes_map.get(t))
+            if pump_index:
+                from pump_monitor import evaluate_pump_for_ticker, apply_pump_to_result
+                pe = evaluate_pump_for_ticker(
+                    t,
+                    pump_index,
+                    entry_phase=r.get("entry_phase") or "",
+                )
+                r = apply_pump_to_result(r, pe)
             score = int(r.get("score") or 0)
             scored_rows.append((score, t, r))
         except Exception as e:
@@ -283,4 +301,6 @@ async def scan_and_score(limit_messages: int = 30, persist: bool = True) -> Dict
         "results": focus + skips,
         "samples": meta.get("samples", []),
         "diff": diff,
+        "pump_tickers": list(pump_index.keys()) if pump_index else [],
+        "pump_messages_checked": (pump_meta or {}).get("messages_checked", 0),
     }
