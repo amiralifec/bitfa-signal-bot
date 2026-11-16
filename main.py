@@ -1,6 +1,6 @@
 """
 BITFA Scorer + Telegram Bot
-نسخه ۱.۹.۰ - pump feed filtered
+نسخه ۱.۹.۱ - audit fixes
 """
 
 import os
@@ -25,7 +25,7 @@ WEBHOOK_BASE = os.getenv("RENDER_EXTERNAL_URL") or "https://bitfa-signal-bot.onr
 CRON_SECRET = os.getenv("CRON_SECRET") or ""
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID") or ""
 
-app = FastAPI(title="BITFA Signal Scorer", version="1.9.0")
+app = FastAPI(title="BITFA Signal Scorer", version="1.9.1")
 
 _scan_locks: Set[int] = set()
 _processed_updates: Set[int] = set()
@@ -167,11 +167,18 @@ def format_single(name: str, result: dict, badge: str = "") -> str:
     kind_txt = " | 🏛 سهام/پرپ" if str(kind).startswith("stock") else ""
     pa_txt = _pa_line(result)
     note_flag = " | 📝" if result.get("analyst_note") else ""
+    pb = result.get("pump_boost")
+    if pb is not None and int(pb) != 0:
+        pump_flag = f" | ⚡{int(pb):+d}"
+    elif result.get("pump_summary"):
+        pump_flag = " | ⚡"
+    else:
+        pump_flag = ""
     badge_txt = f" {badge}" if badge else ""
     tags = _search_tags(token)
     tags_line = f"\n{tags}" if tags else ""
     return (
-        f"{cat_emoji} *#{token}*{badge_txt} | {price_str}{rank_txt}{kind_txt}{pa_txt}{note_flag}\n"
+        f"{cat_emoji} *#{token}*{badge_txt} | {price_str}{rank_txt}{kind_txt}{pa_txt}{note_flag}{pump_flag}\n"
         f"{tags_line}\n"
         f"{score}/100 | {category} | {action} | ریسک: {risk}"
     )
@@ -396,8 +403,9 @@ def format_daily_report(data: dict) -> str:
     return "\n".join(lines)
 
 
-def score_ticker_list(tickers: List[str], notes_map: Optional[Dict[str, Any]] = None) -> dict:
+def score_ticker_list(tickers: List[str], notes_map: Optional[Dict[str, Any]] = None, pump_index: Optional[Dict[str, Any]] = None) -> dict:
     notes_map = notes_map or {}
+    pump_index = pump_index or {}
     results = []
     summary = {"HOT": [], "QUALIFIED": [], "WATCH": [], "SKIP": []}
     rows = []
@@ -405,6 +413,13 @@ def score_ticker_list(tickers: List[str], notes_map: Optional[Dict[str, Any]] = 
         try:
             r = analyze_token(symbol=t)
             r = _apply_note_boost(r, notes_map.get(t.upper()) or notes_map.get(t))
+            if pump_index:
+                try:
+                    from pump_monitor import evaluate_pump_for_ticker, apply_pump_to_result
+                    pe = evaluate_pump_for_ticker(t, pump_index, entry_phase=r.get("entry_phase") or "")
+                    r = apply_pump_to_result(r, pe)
+                except Exception as pe_err:
+                    logger.error(f"pump apply: {pe_err}")
             rows.append((int(r.get("score") or 0), t, r))
         except Exception as e:
             rows.append((0, t, {"error": str(e)[:100], "score": 0, "category": "SKIP", "token": t}))
@@ -515,26 +530,6 @@ def _send_upgrade_alerts(chat_id: int, data: dict) -> None:
     send_telegram_message(chat_id, msg)
 
 
-def run_pump_job_thread(chat_id: int):
-    if chat_id in _scan_locks:
-        send_telegram_message(chat_id, "یک اسکن در حال اجراست. لطفاً صبر کن.")
-        return
-    _scan_locks.add(chat_id)
-    try:
-        from pump_monitor import scan_pumps, format_pump_report
-        async def _run():
-            return await asyncio.wait_for(scan_pumps(limit_messages=40), timeout=120)
-        result = asyncio.run(_run())
-        send_telegram_message(chat_id, format_pump_report(result))
-    except asyncio.TimeoutError:
-        send_telegram_message(chat_id, "⏱ مانیتور پامپ طولانی شد و متوقف شد.")
-    except Exception as e:
-        logger.exception("pump scan failed")
-        send_telegram_message(chat_id, "خطا در /pump:\n" + str(e)[:300])
-    finally:
-        _scan_locks.discard(chat_id)
-
-
 def run_scan_job_thread(chat_id: int, daily: bool = False):
     if chat_id in _scan_locks:
         send_telegram_message(chat_id, "یک اسکن در حال اجراست. لطفاً صبر کن.")
@@ -560,12 +555,12 @@ def run_scan_job_thread(chat_id: int, daily: bool = False):
 
 @app.get("/")
 def root():
-    return {"status": "ok", "version": "1.9.0", "message": "BITFA Scorer - pump feed", "bot": "enabled" if BOT_TOKEN else "disabled", "cron": "/cron/daily-scan?key=CRON_SECRET&chat_id=YOUR_CHAT_ID"}
+    return {"status": "ok", "version": "1.9.1", "message": "BITFA Scorer - integrated pump", "bot": "enabled" if BOT_TOKEN else "disabled", "cron": "/cron/daily-scan?key=CRON_SECRET&chat_id=YOUR_CHAT_ID"}
 
 
 @app.get("/health")
 def health():
-    return {"status": "healthy", "version": "1.9.0"}
+    return {"status": "healthy", "version": "1.9.1"}
 
 
 @app.get("/cron/daily-scan")
@@ -623,7 +618,14 @@ async def telegram_webhook(request: Request):
                 if not tickers:
                     send_telegram_message(chat_id, "در این PDF تیکری پیدا نشد.")
                 else:
-                    scored = score_ticker_list(tickers, notes_map=notes_map)
+                    pump_index = {}
+                    try:
+                        from pump_monitor import fetch_pump_index
+                        pump_meta = await asyncio.wait_for(fetch_pump_index(limit_messages=100, hours=24), timeout=45)
+                        pump_index = (pump_meta or {}).get("index") or {}
+                    except Exception as pe:
+                        logger.error(f"pump index pdf: {pe}")
+                    scored = score_ticker_list(tickers, notes_map=notes_map, pump_index=pump_index)
                     send_telegram_message(chat_id, format_scan(scored))
                     for item in (scored.get("results") or [])[:2]:
                         r = item.get("result") or {}
@@ -637,10 +639,10 @@ async def telegram_webhook(request: Request):
     if not text:
         return Response(status_code=200)
     if text.startswith("/start"):
-        send_telegram_message(chat_id, "سلام 👋\nربات BITFA + PA + فاز + پامپ\n\n• تیکر / آدرس / PDF بفرست\n• /scan اسکن BITFA\n• /pump مومنتوم زودهنگام")
+        send_telegram_message(chat_id, "سلام 👋\nربات BITFA + PA + فاز + پامپ\n\n• تیکر / آدرس / PDF بفرست\n• /scan اسکن BITFA (+ مومنتوم پامپ)")
         return Response(status_code=200)
     if text.startswith("/help"):
-        send_telegram_message(chat_id, "دستورات:\n/scan — اسکن BITFA\n/pump — مومنتوم زودهنگام\nتیکر/آدرس/PDF را مستقیم بفرست.")
+        send_telegram_message(chat_id, "دستورات:\n/scan — اسکن BITFA (+ لایه پامپ)\nتیکر/آدرس/PDF را مستقیم بفرست.")
         return Response(status_code=200)
     if text.startswith("/scan"):
         if chat_id in _scan_locks:
@@ -648,14 +650,6 @@ async def telegram_webhook(request: Request):
             return Response(status_code=200)
         send_telegram_message(chat_id, "در حال اسکن کانال @bitfa ... ⏳\nاگر تا ۳ دقیقه جواب نیامد دوباره /scan بزن.")
         t = threading.Thread(target=run_scan_job_thread, args=(chat_id, False), daemon=True)
-        t.start()
-        return Response(status_code=200)
-    if text.startswith("/pump"):
-        if chat_id in _scan_locks:
-            send_telegram_message(chat_id, "یک اسکن در حال اجراست. لطفاً صبر کن.")
-            return Response(status_code=200)
-        send_telegram_message(chat_id, "در حال خواندن @binance_futures_5m_pump + فیلتر فاز... ⏳")
-        t = threading.Thread(target=run_pump_job_thread, args=(chat_id,), daemon=True)
         t.start()
         return Response(status_code=200)
     if text.startswith("/"):
