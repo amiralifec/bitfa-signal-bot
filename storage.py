@@ -1,5 +1,5 @@
 """
-حافظه ساده اسکن‌های قبلی — فایل JSON روی دیسک
+حافظه اسکن قبلی + کش قرارداد/جفت درست توکن‌ها
 """
 
 import json
@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 
 STORE_PATH = os.getenv("SCAN_STORE_PATH", "last_scan.json")
+TOKEN_CACHE_PATH = os.getenv("TOKEN_CACHE_PATH", "token_cache.json")
 
 CAT_RANK = {"SKIP": 0, "WATCH": 1, "QUALIFIED": 2, "HOT": 3}
 
@@ -43,13 +44,73 @@ def save_last_scan(ticker_scores: Dict[str, Dict[str, Any]]) -> None:
         print(f"save_last_scan error: {e}")
 
 
+def load_token_cache() -> Dict[str, Any]:
+    try:
+        if not os.path.exists(TOKEN_CACHE_PATH):
+            return {"tokens": {}, "updated_at": None}
+        with open(TOKEN_CACHE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {"tokens": {}, "updated_at": None}
+        data.setdefault("tokens", {})
+        return data
+    except Exception as e:
+        print(f"load_token_cache error: {e}")
+        return {"tokens": {}, "updated_at": None}
+
+
+def save_token_cache(tokens: Dict[str, Dict[str, Any]]) -> None:
+    try:
+        payload = {"updated_at": _now_iso(), "tokens": tokens}
+        with open(TOKEN_CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"save_token_cache error: {e}")
+
+
+def get_cached_token(symbol: str) -> Optional[Dict[str, Any]]:
+    if not symbol:
+        return None
+    key = symbol.strip().upper()
+    data = load_token_cache()
+    hit = (data.get("tokens") or {}).get(key)
+    if not hit:
+        return None
+    if not hit.get("address"):
+        return None
+    return hit
+
+
+def set_cached_token(
+    symbol: str,
+    *,
+    address: str,
+    chain: str = "",
+    pair_address: str = "",
+    name: str = "",
+    price_usd: Optional[float] = None,
+) -> None:
+    if not symbol or not address:
+        return
+    key = symbol.strip().upper()
+    data = load_token_cache()
+    tokens = data.get("tokens") or {}
+    prev = tokens.get(key) or {}
+    tokens[key] = {
+        "address": address,
+        "chain": chain or prev.get("chain") or "",
+        "pair_address": pair_address or prev.get("pair_address") or "",
+        "name": name or prev.get("name") or "",
+        "price_usd": price_usd if price_usd is not None else prev.get("price_usd"),
+        "updated_at": _now_iso(),
+    }
+    save_token_cache(tokens)
+
+
 def diff_with_previous(
     current: Dict[str, Dict[str, Any]],
     previous: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """
-    new / improved (+8) / declined (-8) / upgraded (category up) / dropped / deltas
-    """
     prev_full = previous if previous is not None else load_last_scan()
     prev = (prev_full or {}).get("tickers") or {}
 
